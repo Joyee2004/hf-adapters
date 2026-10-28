@@ -67,7 +67,7 @@ to an unprofiled one::
         --with-profiling --trace-dir ./spyre_traces
 
 The --model argument accepts any HuggingFace repo ID or local path
-(default: ibm-granite/granite-3.3-8b-instruct).
+(default: ibm-granite/granite-4.2-8b).
 
 The script exits with code 0 on PASS and code 1 on FAIL or ERROR. A FAIL is
 reported by that exit code alone, not by an exception, so under torchrun the
@@ -88,8 +88,11 @@ summary shows ``Status: PASS`` the test passed.
 """
 
 import argparse
+import contextlib
+import json
 import os
 import sys
+import time
 
 import torch
 import torch.distributed as dist
@@ -104,9 +107,10 @@ if _REPO_ROOT not in sys.path:
 from tests.spyre.test_multicard_spyre import run_multicard_smoke_test  # noqa: E402
 
 DEFAULT_PROMPT = "The capital of France is"
-DEFAULT_MODEL = "ibm-granite/granite-3.3-8b-instruct"
+DEFAULT_MODEL = "ibm-granite/granite-4.2-8b"
 DEFAULT_MAX_NEW_TOKENS = 8
 DEFAULT_TRACE_DIR = "./spyre_traces"
+DEFAULT_PROFILE_ROWS = 30
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -178,6 +182,30 @@ def build_parser() -> argparse.ArgumentParser:
             f"--with-profiling (default: {DEFAULT_TRACE_DIR})."
         ),
     )
+    parser.add_argument(
+        "--profile-rows",
+        type=int,
+        default=DEFAULT_PROFILE_ROWS,
+        metavar="N",
+        help=(
+            "Rows in the key_averages() table printed after a profiled run "
+            f"(default: {DEFAULT_PROFILE_ROWS}; 0 disables the table)."
+        ),
+    )
+    parser.add_argument(
+        "--results-json",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Append this run's summary as one JSON line to PATH (rank 0 only), "
+            "for comparing runs with scripts/compare_multicard_runs.py."
+        ),
+    )
+    parser.add_argument(
+        "--label",
+        default=None,
+        help="Name for this run in --results-json (default: a config summary).",
+    )
     return parser
 
 
@@ -195,6 +223,7 @@ _DTYPE_MAP: dict[str, torch.dtype] = {
 
 
 def main(argv: list[str] | None = None) -> None:
+    wall_t0 = time.time()
     args = build_parser().parse_args(argv)
     if args.dtype is not None:
         if args.dtype not in _DTYPE_MAP:
@@ -209,6 +238,9 @@ def main(argv: list[str] | None = None) -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     is_rank0 = local_rank == 0
+    # Read by the runtime, not by this script; recorded so --results-json can
+    # tell "--with-profiling" runs apart from "PROFILE_LEVEL=light" ones.
+    profile_level = os.environ.get("PROFILE_LEVEL")
 
     # Trim AIU_IDS to WORLD_SIZE entries so a 4-address env var doesn't get
     # printed when only 1 or 2 ranks are actually launched.
@@ -233,32 +265,64 @@ def main(argv: list[str] | None = None) -> None:
         print(
             f"  Profiling        : {args.trace_dir if args.with_profiling else 'off'}"
         )
+        print(f"  PROFILE_LEVEL    : {profile_level!r}")
         print("=" * 70)
 
     if args.prompt_file is not None:
         try:
             with open(args.prompt_file, "r") as _f:
-                prompt = _f.read()
+                file_prompts = [line.strip() for line in _f if line.strip()]
         except OSError as e:
             raise RuntimeError(
                 f"Cannot read prompt file {args.prompt_file!r}: {e}"
             ) from e
+        if not file_prompts:
+            raise RuntimeError(f"Prompt file {args.prompt_file!r} has no prompts")
+        prompt = file_prompts[0]
     else:
+        file_prompts = None
         prompt = DEFAULT_PROMPT
 
-    generate_ctx = None
-    if args.with_profiling:
+    # run_multicard_smoke_test encodes the inputs right before the warmup
+    # generate and enters generate_ctx right after it, so the time between the
+    # two is the warmup.  Swap the encoder it imports to record the start and,
+    # with --prompt-file, to give each batch row its own line (cycling through
+    # the file when --batch exceeds the number of lines) instead of repeating
+    # one prompt --batch times.
+    import tests.conftest as _conftest
+
+    _encode = _conftest.encode_generation_inputs
+    phase_t: dict[str, float] = {}
+
+    def _encode_and_mark(tokenizer, prompts):
+        if file_prompts is not None:
+            prompts = [file_prompts[i % len(file_prompts)] for i in range(len(prompts))]
+        encoded = _encode(tokenizer, prompts)
+        phase_t["warmup_start"] = time.time()
+        return encoded
+
+    _conftest.encode_generation_inputs = _encode_and_mark
+
+    # Holds the profiler once generate_ctx() has been called, so its
+    # key_averages() table can be printed after the run.
+    profilers: list = []
+
+    def generate_ctx():
+        phase_t["warmup_end"] = time.time()
+        if not args.with_profiling:
+            return contextlib.nullcontext()
         from torch.profiler import ProfilerActivity, profile
 
-        def generate_ctx():
-            # Exits (and on_trace_ready fires) inside run_multicard_smoke_test,
-            # well before the os._exit() below skips all teardown.
-            return profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
-                record_shapes=True,
-                profile_memory=True,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(args.trace_dir),
-            )
+        # Exits (and on_trace_ready fires) inside run_multicard_smoke_test,
+        # well before the os._exit() below skips all teardown.
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            record_shapes=True,
+            profile_memory=True,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.trace_dir),
+        )
+        profilers.append(prof)
+        return prof
 
     result = run_multicard_smoke_test(
         args.model,
@@ -271,12 +335,14 @@ def main(argv: list[str] | None = None) -> None:
         generate_ctx=generate_ctx,
     )
 
+    warmup_s = None
+    if "warmup_start" in phase_t and "warmup_end" in phase_t:
+        warmup_s = phase_t["warmup_end"] - phase_t["warmup_start"]
+
     # ── Summary table ──────────────────────────────────────────────────────
     # Each rank builds its summary as one string and writes it atomically.
     # A brief sleep stagger keeps blocks from interleaving in the terminal.
-    import time
-
-    def _rank_summary(r: dict) -> str:
+    def _rank_summary(r: dict, total_s: float) -> str:
         lines = [
             "",
             "=" * 70,
@@ -295,11 +361,13 @@ def main(argv: list[str] | None = None) -> None:
             f"  Batch      : {r['batch_size']}",
             f"  Status     : {r['status']}",
             f"  Load       : {_fmt(r['load_s'], 's')}",
+            f"  Warmup     : {_fmt(warmup_s, 's')}  (untimed generate, incl. compile)",
             f"  Generate   : {_fmt(r['gen_s'], 's')}",
             f"  TTFT       : {_fmt(r['ttft_ms'], ' ms')}",
             f"  Decode avg : {_fmt(r['decode_ms'], ' ms')}",
             f"  Steady ITL : {_fmt(r['steady_itl_ms'], ' ms')}  (outliers excluded)",
             f"  Output     : {r['output']!r}",
+            f"  Total wall : {_fmt(total_s, 's')}  (main() start to this summary)",
         ]
         # gen_s is None when load or warmup failed, i.e. the profiler never ran.
         if args.with_profiling and r["gen_s"] is not None:
@@ -310,9 +378,70 @@ def main(argv: list[str] | None = None) -> None:
         lines += ["=" * 70, ""]
         return "\n".join(lines)
 
+    def _profile_table(prof) -> str:
+        averages = prof.key_averages()
+        # Sort by Spyre (PrivateUse1) time; fall back to CPU time on torch
+        # versions without the device_time fields.
+        for sort_by in ("self_device_time_total", "self_cpu_time_total"):
+            try:
+                table = averages.table(sort_by=sort_by, row_limit=args.profile_rows)
+                break
+            except (AttributeError, KeyError, ValueError):
+                continue
+        else:
+            return ""
+        header = (
+            f"  PROFILE  [rank {local_rank}/{world_size}]  "
+            f"top {args.profile_rows} ops by {sort_by}"
+        )
+        return "\n".join(["", "=" * 70, header, "=" * 70, table, ""])
+
+    profile_table = ""
+    if profilers and result["gen_s"] is not None and args.profile_rows > 0:
+        profile_table = _profile_table(profilers[-1])
+    # Measured after the profile table is built, so it covers everything this
+    # rank did: load, warmup, generate, trace export and table aggregation.
+    total_s = time.time() - wall_t0
+
     time.sleep(local_rank * 0.3)
-    sys.stdout.write(_rank_summary(result))
+    sys.stdout.write(profile_table)
+    sys.stdout.write(_rank_summary(result, total_s))
     sys.stdout.flush()
+
+    if args.results_json and is_rank0:
+        label = args.label or (
+            f"{args.dtype or 'default'} b{args.batch} "
+            f"t{args.max_new_tokens} ws{world_size}"
+            + (" prof" if args.with_profiling else "")
+            + (f" PROFILE_LEVEL={profile_level}" if profile_level else "")
+        )
+        record = {
+            "label": label,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "model": args.model,
+            "dtype": args.dtype,
+            "batch": args.batch,
+            "max_new_tokens": args.max_new_tokens,
+            "min_new_tokens": args.min_new_tokens,
+            "prompt_file": args.prompt_file,
+            "with_profiling": args.with_profiling,
+            "profile_level": profile_level,
+            "world_size": world_size,
+            "status": result["status"],
+            "load_s": result["load_s"],
+            "warmup_s": warmup_s,
+            "gen_s": result["gen_s"],
+            "ttft_ms": result["ttft_ms"],
+            "decode_ms": result["decode_ms"],
+            "steady_itl_ms": result["steady_itl_ms"],
+            "total_s": total_s,
+        }
+        try:
+            with open(args.results_json, "a") as _f:
+                _f.write(json.dumps(record) + "\n")
+        except OSError as e:
+            sys.stdout.write(f"\nCould not write --results-json {args.results_json!r}: {e}\n")
+        sys.stdout.flush()
 
     failed = result["status"] != "PASS"
 
