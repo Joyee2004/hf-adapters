@@ -1,0 +1,103 @@
+Profiling overhead test: before vs after changes
+================================================
+
+Measures TTFT, steady ITL, Gen s and wall clock for three modes, as the median
+of 5 runs (each mode is run 6 times and the first run is dropped):
+  1. no profiling
+  2. --with-profiling
+  3. --with-profiling + PROFILE_LEVEL=light
+
+Run the whole block once on the code WITHOUT your changes (before), then switch
+the installed packages and run it again WITH your changes (after). Keep every
+flag, the model, SPYRE_DEVICES and the pod the same for both sets.
+
+
+1. BEFORE (code without your changes)
+-------------------------------------
+
+cd ~/hf_adapters
+export PYTHONPATH=$PWD:$PYTHONPATH
+export SPYRE_DEVICES=0
+unset PROFILE_LEVEL
+
+OUT=before.jsonl
+rm -f "$OUT"
+mkdir -p traces
+
+run() { torchrun --nproc-per-node=1 --master-port=29500 scripts/run_multicard_smoke.py \
+    --dtype float16 --prompt-file scripts/prompts.txt --batch 10 --max-new-tokens 128 --min-new-tokens 128 \
+    --results-json "$OUT" "$@"; }
+
+for i in 1 2 3 4 5 6; do
+    run
+    run --with-profiling --trace-dir traces/before_prof
+    PROFILE_LEVEL=light run --with-profiling --trace-dir traces/before_light
+done 2>&1 | tee before.log
+
+
+2. AFTER (code with your changes)
+---------------------------------
+
+Switch the installed packages (flex etc.) to the version with your changes, and
+check the switch took effect (pip show / git commit / loaded .so path). Clear
+the compile caches if you want build time included in the comparison.
+
+cd ~/hf_adapters
+export PYTHONPATH=$PWD:$PYTHONPATH
+export SPYRE_DEVICES=0
+unset PROFILE_LEVEL
+
+OUT=after1.jsonl
+rm -f "$OUT"
+mkdir -p traces
+
+run() { torchrun --nproc-per-node=1 --master-port=29500 scripts/run_multicard_smoke.py \
+    --dtype float16 --prompt-file scripts/prompts.txt --batch 10 --max-new-tokens 128 --min-new-tokens 128 \
+    --results-json "$OUT" "$@"; }
+
+for i in 1 2 3 4 5 6; do
+    run
+    run --with-profiling --trace-dir traces/after1_prof
+    PROFILE_LEVEL=light run --with-profiling --trace-dir traces/after1_light
+done 2>&1 | tee after.log
+
+
+3. COMPARE
+----------
+
+python3 scripts/compare_multicard_runs.py before.jsonl after.jsonl
+
+Prints one before/after table per mode. The compare script needs no torch, so
+you can also copy the two JSONL files off the pod and run it on a laptop.
+
+
+Output of each set
+------------------
+
+<OUT>.jsonl  18 lines (6 passes x 3 modes), labels:
+               float16 b10 t128 ws1
+               float16 b10 t128 ws1 prof
+               float16 b10 t128 ws1 prof PROFILE_LEVEL=light
+traces/      profiler traces, one directory per mode and version
+<OUT>.log    full console output
+
+
+Notes
+-----
+
+- Model: the default, ibm-granite/granite-4.2-8b. It is not in
+  tests/model_registry.py, so do one quick single run first to make sure it
+  loads before starting all 18.
+- Don't pass --label: the default label carries the mode, and before/after are
+  matched by label.
+- Don't `export PROFILE_LEVEL`; set it only in front of the third command.
+- The JSONL files are appended to, never overwritten. Delete them (rm -f
+  above) before a fresh set, or old runs get mixed into the median.
+- Prompts: without --prompt-file all 10 rows are "The capital of France is".
+  To use the first 10 lines of scripts/prompts.txt, add
+  --prompt-file scripts/prompts.txt to run() in BOTH sets.
+- More cards: SPYRE_DEVICES=0,1 and --nproc-per-node=2 (labels end in ws2).
+- Each run loads and compiles from scratch, so 18 runs take a while. Use tmux
+  or nohup so a dropped connection doesn't kill the loop.
+- Wall s includes load and compile; Gen s / TTFT / ITL cover generation only.
+  With a median of 5, treat differences of about 1-2% as noise.
