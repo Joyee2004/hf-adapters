@@ -197,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "Append this run's summary as one JSON line to PATH (rank 0 only), "
+            "Append this run's summary to PATH as one JSON line per rank, "
             "for comparing runs with scripts/compare_multicard_runs.py."
         ),
     )
@@ -408,7 +408,9 @@ def main(argv: list[str] | None = None) -> None:
     sys.stdout.write(_rank_summary(result, total_s))
     sys.stdout.flush()
 
-    if args.results_json and is_rank0:
+    # Every rank writes its own line, after the stagger above, so on multi-card
+    # runs each card's timings are kept and the lines don't interleave.
+    if args.results_json:
         label = args.label or (
             f"{args.dtype or 'default'} b{args.batch} "
             f"t{args.max_new_tokens} ws{world_size}"
@@ -427,6 +429,8 @@ def main(argv: list[str] | None = None) -> None:
             "with_profiling": args.with_profiling,
             "profile_level": profile_level,
             "world_size": world_size,
+            "rank": local_rank,
+            "spyre_devices": spyre_devices,
             "status": result["status"],
             "load_s": result["load_s"],
             "warmup_s": warmup_s,
