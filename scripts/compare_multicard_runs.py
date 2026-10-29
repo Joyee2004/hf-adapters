@@ -27,22 +27,27 @@ With one file, each label is compared against the first label (or
 With several files, each file is one code version (e.g. before and after a
 profiling change) and every label is compared against the same label in the
 first file.  To check whether a change adds overhead without the profiler,
-with it, and with ``PROFILE_LEVEL=light``, record 6 repeats of each mode per
-version (the default labels already tell the modes apart)::
+with it, and with ``PROFILE_LEVEL=light``, record each version with
+``scripts/run_profiling_overhead.sh``.  It runs the three modes interleaved,
+6 passes by default (``REPEATS=N`` to change), and writes ``NAME.jsonl``,
+``NAME.log`` and ``traces/NAME_{prof,light}/``; the default labels tell the
+modes apart::
 
-    run() { torchrun --nproc-per-node=1 scripts/run_multicard_smoke.py \\
-        --dtype float16 --max-new-tokens 64 --min-new-tokens 64 \\
-        --results-json "$OUT" "$@"; }
-    for i in 1 2 3 4 5 6; do
-        run
-        run --with-profiling
-        PROFILE_LEVEL=light run --with-profiling
-    done
-
-    # once with OUT=before.jsonl on the old code, once with OUT=after.jsonl
+    bash scripts/run_profiling_overhead.sh before   # on the code without the change
+    # switch the installed packages to the version with the change, then:
+    bash scripts/run_profiling_overhead.sh after
     python3 scripts/compare_multicard_runs.py before.jsonl after.jsonl
 
-Interleaving the modes inside the loop spreads node noise across all three.
+For multi-card runs, list the cards in ``SPYRE_DEVICES``; one rank is
+launched per card and the labels end in ``ws<cards>``, so use the same cards
+for every version::
+
+    SPYRE_DEVICES=0,1 bash scripts/run_profiling_overhead.sh before
+
+Extra arguments are passed on to every run (e.g. ``... before --batch 4``);
+pass the same ones for every version, and never ``--label``.  The script's
+header lists the rest of its options.
+
 Needs no torch; it can run on a laptop after copying the JSONL off the pod.
 """
 

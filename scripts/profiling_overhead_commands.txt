@@ -7,32 +7,35 @@ of 5 runs (each mode is run 6 times and the first run is dropped):
   2. --with-profiling
   3. --with-profiling + PROFILE_LEVEL=light
 
-Run the whole block once on the code WITHOUT your changes (before), then switch
-the installed packages and run it again WITH your changes (after). Keep every
-flag, the model, SPYRE_DEVICES and the pod the same for both sets.
+scripts/run_profiling_overhead.sh does one whole set (all three modes,
+interleaved, 6 passes) for one code version. Run it once on the code WITHOUT
+your changes (before), switch the installed packages, then run it again WITH
+your changes (after). Every run uses:
+
+  --dtype float16 --prompt-file scripts/prompts.txt --batch 16
+  --max-new-tokens 128 --min-new-tokens 128
+
+
+0. SETUP (once per pod session)
+-------------------------------
+
+cd ~/hf_adapters
+tmux new -s overhead        # 18 runs take a while; survives a dropped connection
+
+The script sets PYTHONPATH, unsets PROFILE_LEVEL and creates traces/ itself.
 
 
 1. BEFORE (code without your changes)
 -------------------------------------
 
-cd ~/hf_adapters
-export PYTHONPATH=$PWD:$PYTHONPATH
-export SPYRE_DEVICES=0
-unset PROFILE_LEVEL
+1 card:
+    bash scripts/run_profiling_overhead.sh before
 
-OUT=before.jsonl
-rm -f "$OUT"
-mkdir -p traces
+2 cards (valid indices are node-specific; one rank is launched per card):
+    SPYRE_DEVICES=0,1 bash scripts/run_profiling_overhead.sh before
 
-run() { torchrun --nproc-per-node=1 --master-port=29500 scripts/run_multicard_smoke.py \
-    --dtype float16 --prompt-file scripts/prompts.txt --batch 10 --max-new-tokens 128 --min-new-tokens 128 \
-    --results-json "$OUT" "$@"; }
-
-for i in 1 2 3 4 5 6; do
-    run
-    run --with-profiling --trace-dir traces/before_prof
-    PROFILE_LEVEL=light run --with-profiling --trace-dir traces/before_light
-done 2>&1 | tee before.log
+4 cards:
+    SPYRE_DEVICES=0,1,2,3 bash scripts/run_profiling_overhead.sh before
 
 
 2. AFTER (code with your changes)
@@ -42,24 +45,13 @@ Switch the installed packages (flex etc.) to the version with your changes, and
 check the switch took effect (pip show / git commit / loaded .so path). Clear
 the compile caches if you want build time included in the comparison.
 
-cd ~/hf_adapters
-export PYTHONPATH=$PWD:$PYTHONPATH
-export SPYRE_DEVICES=0
-unset PROFILE_LEVEL
+Then run the same command as BEFORE, with the name changed and the SAME
+SPYRE_DEVICES and extra arguments:
 
-OUT=after1.jsonl
-rm -f "$OUT"
-mkdir -p traces
+    bash scripts/run_profiling_overhead.sh after
+    # or: SPYRE_DEVICES=0,1 bash scripts/run_profiling_overhead.sh after
 
-run() { torchrun --nproc-per-node=1 --master-port=29500 scripts/run_multicard_smoke.py \
-    --dtype float16 --prompt-file scripts/prompts.txt --batch 10 --max-new-tokens 128 --min-new-tokens 128 \
-    --results-json "$OUT" "$@"; }
-
-for i in 1 2 3 4 5 6; do
-    run
-    run --with-profiling --trace-dir traces/after1_prof
-    PROFILE_LEVEL=light run --with-profiling --trace-dir traces/after1_light
-done 2>&1 | tee after.log
+To compare several versions, give each its own name (after1, after2, ...).
 
 
 3. COMPARE
@@ -67,37 +59,63 @@ done 2>&1 | tee after.log
 
 python3 scripts/compare_multicard_runs.py before.jsonl after.jsonl
 
-Prints one before/after table per mode. The compare script needs no torch, so
-you can also copy the two JSONL files off the pod and run it on a laptop.
+Prints one before/after table per mode. More versions:
+    python3 scripts/compare_multicard_runs.py before.jsonl after1.jsonl after2.jsonl
+
+The compare script needs no torch, so you can also copy the JSONL files off the
+pod and run it on a laptop:
+    kubectl cp $NS/$POD:$HOME/hf_adapters/before.jsonl before.jsonl
+    kubectl cp $NS/$POD:$HOME/hf_adapters/after.jsonl after.jsonl
 
 
-Output of each set
-------------------
+Options
+-------
 
-<OUT>.jsonl  18 lines (6 passes x 3 modes), labels:
-               float16 b10 t128 ws1
-               float16 b10 t128 ws1 prof
-               float16 b10 t128 ws1 prof PROFILE_LEVEL=light
-traces/      profiler traces, one directory per mode and version
-<OUT>.log    full console output
+REPEATS=N        passes over the three modes (default 6 -> median of 5)
+                     REPEATS=3 bash scripts/run_profiling_overhead.sh quick
+SPYRE_DEVICES    comma-separated card indices (default 0)
+MASTER_PORT      torchrun port (default 29500); change it if 29500 is in use
+extra arguments  passed on to every run, e.g.
+                     bash scripts/run_profiling_overhead.sh before --max-new-tokens 256 --min-new-tokens 256
+
+Background instead of tmux:
+    nohup bash scripts/run_profiling_overhead.sh before_opt >/dev/null 2>&1 &
+    tail -f before.log
+
+
+Output of each set (NAME = before, after, ...)
+----------------------------------------------
+
+NAME.jsonl          18 lines (6 passes x 3 modes), written by rank 0, labels:
+                      float16 b16 t128 ws1
+                      float16 b16 t128 ws1 prof
+                      float16 b16 t128 ws1 prof PROFILE_LEVEL=light
+                    (ws2 / ws4 with 2 / 4 cards)
+NAME.log            full console output, every rank's summary
+traces/NAME_prof/   profiler traces for mode 2, one file per rank per run
+traces/NAME_light/  profiler traces for mode 3, one file per rank per run
 
 
 Notes
 -----
 
 - Model: the default, ibm-granite/granite-4.2-8b. It is not in
-  tests/model_registry.py, so do one quick single run first to make sure it
-  loads before starting all 18.
-- Don't pass --label: the default label carries the mode, and before/after are
-  matched by label.
-- Don't `export PROFILE_LEVEL`; set it only in front of the third command.
-- The JSONL files are appended to, never overwritten. Delete them (rm -f
-  above) before a fresh set, or old runs get mixed into the median.
-- Prompts: without --prompt-file all 10 rows are "The capital of France is".
-  To use the first 10 lines of scripts/prompts.txt, add
-  --prompt-file scripts/prompts.txt to run() in BOTH sets.
-- More cards: SPYRE_DEVICES=0,1 and --nproc-per-node=2 (labels end in ws2).
-- Each run loads and compiles from scratch, so 18 runs take a while. Use tmux
-  or nohup so a dropped connection doesn't kill the loop.
+  tests/model_registry.py. The script's first run doubles as a check: if it
+  fails (bad card index, model doesn't load, a buffer over the 256 MB
+  per-core limit), the set stops instead of burning all 18 runs. Later
+  failures are recorded with their status and the loop keeps going.
+- Batch: 16 by default. Batch 64 fails to compile: prefill builds a
+  [batch, 512, 100352] float16 logits buffer, 784 MB per core at batch 64.
+  The buffer grows with batch, so try a larger one with a quick
+  REPEATS=1 run (e.g. ... quick --batch 20) before a full set.
+- The script refuses to overwrite: if NAME.jsonl exists, delete it or pick
+  another name. Old runs would otherwise be mixed into the median.
+- Don't pass --label (before/after are matched by the default label) or
+  --iterations (each run is a fresh process with one timed generate).
+- Keep SPYRE_DEVICES, extra arguments, the model and the pod the same for
+  every version you compare. Labels end in ws<cards>, so different card counts
+  are never matched against each other.
+- Prompts: batch 16 uses the first 16 lines of scripts/prompts.txt, one per
+  row.
 - Wall s includes load and compile; Gen s / TTFT / ITL cover generation only.
   With a median of 5, treat differences of about 1-2% as noise.
