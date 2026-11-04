@@ -103,7 +103,7 @@ mkdir -p traces
 run() {
     torchrun --nproc-per-node="$nproc" --master-port="${MASTER_PORT:-29500}" \
         scripts/run_multicard_smoke.py \
-        --dtype float16 --prompt-file scripts/prompts.txt --batch 16 \
+        --dtype float16 --prompt-file scripts/prompts.txt --batch 64 \
         --max-new-tokens 128 --min-new-tokens 128 \
         --results-json "$out" "$@"
 }
