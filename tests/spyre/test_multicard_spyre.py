@@ -186,6 +186,9 @@ def run_multicard_smoke_test(
         ttft_ms            - first-token latency in ms (or None)
         decode_ms          - avg next-token latency in ms (or None)
         steady_itl_ms      - steady-state ITL with outliers removed (or None)
+        iterations         - one dict per timed run that started, in order, with
+                             its status, gen_s, ttft_ms, decode_ms and
+                             steady_itl_ms (the top-level keys hold the last)
         output             - generated text for sequence 0 (empty string on any error)
         error              - "PHASE FAILED\\n<traceback>" string, or None on PASS
     """
@@ -254,6 +257,7 @@ def run_multicard_smoke_test(
         "ttft_ms": None,
         "decode_ms": None,
         "steady_itl_ms": None,
+        "iterations": [],
         "outputs": [],  # decoded text per sequence (populated after generation)
         "output": "",  # sequence 0 text, for backward-compat / single-card use
         "seq_checks": [],
@@ -382,6 +386,15 @@ def run_multicard_smoke_test(
             result["seq_checks"] = seq_checks
             all_pass = all(v for c in seq_checks for k, v in c.items())
             result["status"] = "PASS" if all_pass else "FAIL"
+            result["iterations"].append(
+                {
+                    "status": result["status"],
+                    "gen_s": result["gen_s"],
+                    "ttft_ms": ttft,
+                    "decode_ms": decode,
+                    "steady_itl_ms": result["steady_itl_ms"],
+                }
+            )
             if not all_pass:
                 for i, c in enumerate(seq_checks):
                     failed = [k for k, v in c.items() if not v]
@@ -391,6 +404,16 @@ def run_multicard_smoke_test(
         except Exception:
             result["gen_s"] = time.time() - gen_t0
             result["error"] = "GENERATE FAILED\n" + traceback.format_exc()
+            result["status"] = "ERROR"
+            result["iterations"].append(
+                {
+                    "status": "ERROR",
+                    "gen_s": result["gen_s"],
+                    "ttft_ms": None,
+                    "decode_ms": None,
+                    "steady_itl_ms": None,
+                }
+            )
             print(
                 f"  [rank {local_rank}] Generate FAILED (after {result['gen_s']:.1f}s):\n{result['error']}"
             )
