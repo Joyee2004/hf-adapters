@@ -133,9 +133,11 @@ Notes
 - The compare drops timed run 0 of every mode (the profiler's warmup; also
   dropped for off so all modes cover the same runs) and takes the median of
   runs 1-5. Keep the iteration counts the same for every version.
-- Each mode is one process, so Load, Warmup and Run s are measured once per
-  mode and repeated on its lines. Run s is the wall clock of all its timed
-  runs (load and warmup excluded; the profiler's trace export included).
+- Each mode is one process, so Load, Warmup, Run s and Run-exp s are measured
+  once per mode and repeated on its lines. Run s is the wall clock of timed
+  runs 1-5 (load, warmup and run 0 excluded), including the profiler's trace
+  export; Run-exp s is Run s minus that export, so it shows whether a profiled
+  mode is slower at generating or only at writing the trace.
   Gen s / TTFT / ITL are per timed run.
 - With a median of 5, treat differences of about 1-2% as noise. Modes run one
   after another, so node noise that comes and goes can land on one mode only;

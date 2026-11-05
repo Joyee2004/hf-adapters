@@ -120,6 +120,9 @@ DEFAULT_TRACE_DIR = "./spyre_traces"
 DEFAULT_PROFILE_ROWS = 30
 DEFAULT_PROFILE_WARMUP = 1
 DEFAULT_PROFILE_ACTIVE = 5
+# Run wall starts at this timed run; it matches the compare script's default
+# --skip-first, so Run wall covers the same runs as the medians.
+RUN_WALL_FIRST_RUN = 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -343,7 +346,7 @@ def main(argv: list[str] | None = None) -> None:
         if file_prompts is not None:
             prompts = [file_prompts[i % len(file_prompts)] for i in range(len(prompts))]
         encoded = _encode(tokenizer, prompts)
-        phase_t["warmup_start"] = time.time()
+        phase_t["warmup_start"] = time.perf_counter()
         return encoded
 
     _conftest.encode_generation_inputs = _encode_and_mark
@@ -352,10 +355,20 @@ def main(argv: list[str] | None = None) -> None:
     # run and steps it after each, so the schedule discards the warmup runs and
     # records the active ones into a single trace.  The trace is exported
     # (on_trace_ready) by the step after the last active run, inside
-    # run_multicard_smoke_test and outside its gen_s timing.
+    # run_multicard_smoke_test and outside its gen_s timing; the export is
+    # timed on its own so it can be told apart from generate in Run wall.
     prof = None
     prof_started = False
+    export_s: float | None = None
     if args.with_profiling:
+        write_trace = torch.profiler.tensorboard_trace_handler(args.trace_dir)
+
+        def on_trace_ready(p) -> None:
+            nonlocal export_s
+            t0 = time.perf_counter()
+            write_trace(p)
+            export_s = (export_s or 0.0) + time.perf_counter() - t0
+
         from torch.profiler import ProfilerActivity, profile, schedule
 
         prof = profile(
@@ -368,14 +381,22 @@ def main(argv: list[str] | None = None) -> None:
             ),
             record_shapes=True,
             profile_memory=True,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.trace_dir),
+            on_trace_ready=on_trace_ready,
         )
+
+    timed_runs = 0
 
     @contextlib.contextmanager
     def generate_ctx():
-        nonlocal prof_started
-        # Entered right before each timed run; only the first ends the warmup.
-        phase_t.setdefault("warmup_end", time.time())
+        nonlocal prof_started, timed_runs
+        # Entered right before each timed run; the first ends the warmup, and
+        # Run wall starts at the second, run 0 being the one the compare drops
+        # (the profiler's warmup run on profiled modes).
+        now = time.perf_counter()
+        phase_t.setdefault("warmup_end", now)
+        if timed_runs == RUN_WALL_FIRST_RUN:
+            phase_t["run_wall_start"] = now
+        timed_runs += 1
         if prof is not None and not prof_started:
             prof.start()
             prof_started = True
@@ -393,13 +414,19 @@ def main(argv: list[str] | None = None) -> None:
         num_iterations=args.iterations,
         generate_ctx=generate_ctx,
     )
-    # Wall clock of the timed runs: from the end of the untimed warmup (the
-    # first generate_ctx() entry) to the return above, so it excludes load and
-    # warmup but includes the per-run checks and the profiler's trace export.
-    # None when load or warmup failed and no timed run started.
-    run_s = time.time() - phase_t["warmup_end"] if "warmup_end" in phase_t else None
+    # Wall clock of timed runs 1 onward: from the start of run 1 to the return
+    # above, so it excludes load, warmup and run 0 but includes the per-run
+    # checks and the profiler's trace export.  None when run 1 never started
+    # (--iterations 1, or a failure before it).
+    run_s = None
+    run_noexport_s = None
+    if "run_wall_start" in phase_t:
+        run_s = time.perf_counter() - phase_t["run_wall_start"]
+        # Taken before prof.stop(): an export it triggers is outside Run wall.
+        run_noexport_s = run_s - (export_s or 0.0)
     # Saves a partial trace when a failure cut the active runs short; a no-op
-    # once the schedule has finished.
+    # once the schedule has finished.  Outside Run wall, but still counted in
+    # export_s.
     if prof_started:
         prof.stop()
 
@@ -436,7 +463,8 @@ def main(argv: list[str] | None = None) -> None:
             f"  Decode avg : {_fmt(r['decode_ms'], ' ms')}",
             f"  Steady ITL : {_fmt(r['steady_itl_ms'], ' ms')}  (outliers excluded)",
             f"  Output     : {r['output']!r}",
-            f"  Run wall   : {_fmt(run_s, 's')}  (all timed runs; load and warmup excluded)",
+            f"  Run wall   : {_fmt(run_s, 's')}  (timed runs {RUN_WALL_FIRST_RUN}+, incl. trace export)",
+            f"  Run-export : {_fmt(run_noexport_s, 's')}  (Run wall minus trace export)",
         ]
         # Generate..Steady ITL above are the last timed run; list them all.
         if len(its) > 1:
@@ -459,6 +487,7 @@ def main(argv: list[str] | None = None) -> None:
         # gen_s is None when load or warmup failed, i.e. the profiler never ran.
         if args.with_profiling and r["gen_s"] is not None:
             lines.append(f"  Trace dir  : {args.trace_dir}")
+            lines.append(f"  Export     : {_fmt(export_s, 's')}  (writing the trace)")
         if r["error"]:
             lines += ["", "  ERROR DETAIL:"]
             lines += [f"    {line}" for line in r["error"].splitlines()]
@@ -527,6 +556,8 @@ def main(argv: list[str] | None = None) -> None:
             "load_s": result["load_s"],
             "warmup_s": warmup_s,
             "run_s": run_s,
+            "export_s": export_s,
+            "run_noexport_s": run_noexport_s,
         }
         no_run = {
             "status": result["status"],
