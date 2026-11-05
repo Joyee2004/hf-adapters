@@ -120,9 +120,6 @@ DEFAULT_TRACE_DIR = "./spyre_traces"
 DEFAULT_PROFILE_ROWS = 30
 DEFAULT_PROFILE_WARMUP = 1
 DEFAULT_PROFILE_ACTIVE = 5
-# Run wall starts at this timed run; it matches the compare script's default
-# --skip-first, so Run wall covers the same runs as the medians.
-RUN_WALL_FIRST_RUN = 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -356,10 +353,15 @@ def main(argv: list[str] | None = None) -> None:
     # records the active ones into a single trace.  The trace is exported
     # (on_trace_ready) by the step after the last active run, inside
     # run_multicard_smoke_test and outside its gen_s timing; the export is
-    # timed on its own so it can be told apart from generate in Run wall.
+    # timed on its own and charged to the timed run it happened in, so each
+    # run's wall clock can be shown with and without it.
     prof = None
     prof_started = False
-    export_s: float | None = None
+    # Per timed run: wall-clock start, and trace-export seconds inside it.
+    run_starts: list[float] = []
+    run_exports: list[float] = []
+    runs_done = False  # set once the last run's wall clock has ended
+    export_s: float | None = None  # every export, incl. one after the last run
     if args.with_profiling:
         write_trace = torch.profiler.tensorboard_trace_handler(args.trace_dir)
 
@@ -367,7 +369,10 @@ def main(argv: list[str] | None = None) -> None:
             nonlocal export_s
             t0 = time.perf_counter()
             write_trace(p)
-            export_s = (export_s or 0.0) + time.perf_counter() - t0
+            dt = time.perf_counter() - t0
+            export_s = (export_s or 0.0) + dt
+            if run_exports and not runs_done:
+                run_exports[-1] += dt
 
         from torch.profiler import ProfilerActivity, profile, schedule
 
@@ -384,19 +389,17 @@ def main(argv: list[str] | None = None) -> None:
             on_trace_ready=on_trace_ready,
         )
 
-    timed_runs = 0
-
     @contextlib.contextmanager
     def generate_ctx():
-        nonlocal prof_started, timed_runs
-        # Entered right before each timed run; the first ends the warmup, and
-        # Run wall starts at the second, run 0 being the one the compare drops
-        # (the profiler's warmup run on profiled modes).
+        nonlocal prof_started
+        # Entered right before each timed run; the first ends the warmup.  A
+        # run's wall clock lasts until the next run starts (or, for the last,
+        # until run_multicard_smoke_test returns), so it covers generate, the
+        # profiler step and export after it, and the output checks.
         now = time.perf_counter()
         phase_t.setdefault("warmup_end", now)
-        if timed_runs == RUN_WALL_FIRST_RUN:
-            phase_t["run_wall_start"] = now
-        timed_runs += 1
+        run_starts.append(now)
+        run_exports.append(0.0)
         if prof is not None and not prof_started:
             prof.start()
             prof_started = True
@@ -414,21 +417,19 @@ def main(argv: list[str] | None = None) -> None:
         num_iterations=args.iterations,
         generate_ctx=generate_ctx,
     )
-    # Wall clock of timed runs 1 onward: from the start of run 1 to the return
-    # above, so it excludes load, warmup and run 0 but includes the per-run
-    # checks and the profiler's trace export.  None when run 1 never started
-    # (--iterations 1, or a failure before it).
-    run_s = None
-    run_noexport_s = None
-    if "run_wall_start" in phase_t:
-        run_s = time.perf_counter() - phase_t["run_wall_start"]
-        # Taken before prof.stop(): an export it triggers is outside Run wall.
-        run_noexport_s = run_s - (export_s or 0.0)
+    # Taken before prof.stop(): an export it triggers belongs to no run.
+    run_ends = run_starts[1:] + [time.perf_counter()]
+    runs_done = True
+    run_walls = [end - start for start, end in zip(run_starts, run_ends)]
     # Saves a partial trace when a failure cut the active runs short; a no-op
-    # once the schedule has finished.  Outside Run wall, but still counted in
-    # export_s.
+    # once the schedule has finished.  Counted in export_s only.
     if prof_started:
         prof.stop()
+    # One entry per run that started; result["iterations"] has the same runs.
+    for it, wall, exp in zip(result["iterations"], run_walls, run_exports):
+        it["wall_s"] = wall
+        it["export_s"] = exp if args.with_profiling else None
+        it["wall_noexport_s"] = wall - exp
 
     warmup_s = None
     if "warmup_start" in phase_t and "warmup_end" in phase_t:
@@ -463,8 +464,6 @@ def main(argv: list[str] | None = None) -> None:
             f"  Decode avg : {_fmt(r['decode_ms'], ' ms')}",
             f"  Steady ITL : {_fmt(r['steady_itl_ms'], ' ms')}  (outliers excluded)",
             f"  Output     : {r['output']!r}",
-            f"  Run wall   : {_fmt(run_s, 's')}  (timed runs {RUN_WALL_FIRST_RUN}+, incl. trace export)",
-            f"  Run-export : {_fmt(run_noexport_s, 's')}  (Run wall minus trace export)",
         ]
         # Generate..Steady ITL above are the last timed run; list them all.
         if len(its) > 1:
@@ -481,13 +480,15 @@ def main(argv: list[str] | None = None) -> None:
                     )
                 lines.append(
                     f"    [{i}] {it['status']:<5} gen {_fmt(it['gen_s'], 's')}"
+                    f"  wall {_fmt(it.get('wall_s'), 's')}"
+                    f"  wall-exp {_fmt(it.get('wall_noexport_s'), 's')}"
                     f"  TTFT {_fmt(it['ttft_ms'], ' ms')}"
                     f"  ITL {_fmt(it['steady_itl_ms'], ' ms')}{tag}"
                 )
         # gen_s is None when load or warmup failed, i.e. the profiler never ran.
         if args.with_profiling and r["gen_s"] is not None:
             lines.append(f"  Trace dir  : {args.trace_dir}")
-            lines.append(f"  Export     : {_fmt(export_s, 's')}  (writing the trace)")
+            lines.append(f"  Export     : {_fmt(export_s, 's')}  (writing the trace, all runs)")
         if r["error"]:
             lines += ["", "  ERROR DETAIL:"]
             lines += [f"    {line}" for line in r["error"].splitlines()]
@@ -526,8 +527,9 @@ def main(argv: list[str] | None = None) -> None:
 
     # Every rank writes one line per timed run, after the stagger above, so on
     # multi-card runs each card's timings are kept and the lines don't
-    # interleave.  Load, warmup and wall times are per process, so they repeat
-    # on each of its lines.  A load or warmup failure, which leaves no timed
+    # interleave.  Load and warmup are per process, so they repeat on each of
+    # its lines; wall_s and wall_noexport_s are per run.  A load or warmup
+    # failure, which leaves no timed
     # run, still gets one line so the failure shows up in the compare.
     if args.results_json:
         label = args.label or (
@@ -555,13 +557,13 @@ def main(argv: list[str] | None = None) -> None:
             "profile_active": args.profile_active if args.with_profiling else None,
             "load_s": result["load_s"],
             "warmup_s": warmup_s,
-            "run_s": run_s,
-            "export_s": export_s,
-            "run_noexport_s": run_noexport_s,
         }
         no_run = {
             "status": result["status"],
             "gen_s": None,
+            "wall_s": None,
+            "wall_noexport_s": None,
+            "export_s": None,
             "ttft_ms": None,
             "decode_ms": None,
             "steady_itl_ms": None,

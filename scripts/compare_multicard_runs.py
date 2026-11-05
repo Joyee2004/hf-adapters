@@ -58,12 +58,12 @@ import sys
 
 # (record key, column header, format)
 _METRICS = [
-    ("ttft_ms", "TTFT ms", "{:.1f}"),
-    ("steady_itl_ms", "ITL ms", "{:.1f}"),
-    ("gen_s", "Gen s", "{:.2f}"),
-    ("run_s", "Run s", "{:.1f}"),
-    ("run_noexport_s", "Run-exp s", "{:.1f}"),
-    ("tok_s", "Tok/s", "{:.1f}"),
+    ("ttft_ms", "TTFT ms", "{:.3f}"),
+    ("steady_itl_ms", "ITL ms", "{:.3f}"),
+    ("gen_s", "Gen s", "{:.3f}"),
+    ("wall_s", "Wall s", "{:.3f}"),
+    ("wall_noexport_s", "Wall-exp s", "{:.3f}"),
+    ("tok_s", "Tok/s", "{:.3f}"),
 ]
 
 
@@ -235,9 +235,9 @@ def main(argv: list[str] | None = None) -> None:
         "ones on profiled runs); N = kept/total lines."
     )
     print(
-        "Tok/s = batch / steady ITL (decode throughput).  Run s = wall clock of "
-        "timed runs 1 onward in the process (load, warmup and run 0 excluded), "
-        "incl. trace export; Run-exp s = Run s minus the trace export."
+        "Tok/s = batch / steady ITL (decode throughput).  Wall s = per-run wall "
+        "clock (generate, profiler step and trace export, output checks); "
+        "Wall-exp s = Wall s minus the trace export."
     )
 
 
