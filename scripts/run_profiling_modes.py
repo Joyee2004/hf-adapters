@@ -65,7 +65,7 @@ MODES = {
 DEFAULT_SMOKE_ARGS = [
     "--dtype", "float16",
     "--prompt-file", "scripts/prompts.txt",
-    "--batch", "16",
+    "--batch", "64",
     "--max-new-tokens", "128",
     "--min-new-tokens", "128",
 ]  # fmt: skip

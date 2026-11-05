@@ -62,6 +62,7 @@ _METRICS = [
     ("steady_itl_ms", "ITL ms", "{:.1f}"),
     ("gen_s", "Gen s", "{:.2f}"),
     ("run_s", "Run s", "{:.1f}"),
+    ("run_noexport_s", "Run-exp s", "{:.1f}"),
     ("tok_s", "Tok/s", "{:.1f}"),
 ]
 
@@ -235,7 +236,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(
         "Tok/s = batch / steady ITL (decode throughput).  Run s = wall clock of "
-        "all timed runs in the process (load and warmup excluded)."
+        "timed runs 1 onward in the process (load, warmup and run 0 excluded), "
+        "incl. trace export; Run-exp s = Run s minus the trace export."
     )
 
 

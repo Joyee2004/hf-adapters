@@ -274,20 +274,20 @@ def run_multicard_smoke_test(
 
     model = None
     tokenizer = None
-    load_t0 = time.time()
+    load_t0 = time.perf_counter()
     try:
         tp = "auto" if world_size > 1 else None
         kwargs: dict[str, Any] = {"tp_plan": tp, "trust_remote_code": trust_remote_code}
         if dtype is not None:
             kwargs["dtype"] = dtype
         model = AutoSpyreModelForCausalLM.from_pretrained(model_path, **kwargs)
-        result["load_s"] = time.time() - load_t0
+        result["load_s"] = time.perf_counter() - load_t0
         tokenizer = AutoTokenizer.from_pretrained(
             model_path, trust_remote_code=trust_remote_code
         )
         print(f"  Load time  : {result['load_s']:.1f}s  [OK]")
     except Exception:
-        result["load_s"] = time.time() - load_t0
+        result["load_s"] = time.perf_counter() - load_t0
         result["error"] = "LOAD FAILED\n" + traceback.format_exc()
         print(
             f"  [rank {local_rank}] Load FAILED (after {result['load_s']:.1f}s):\n{result['error']}"
@@ -340,14 +340,14 @@ def run_multicard_smoke_test(
     # ── Phase 3: generation ────────────────────────────────────────────────
     for run_idx in range(num_iterations):
         print(f"\n{'=' * 20} Run Model... (run {run_idx + 1}/{num_iterations})")
-        gen_t0 = time.time()
+        gen_t0 = time.perf_counter()
         try:
             with (
                 generate_ctx() if generate_ctx is not None else contextlib.nullcontext()
             ):
                 output_texts, captured = _run_generate()
                 # Inside the ctx so gen_s excludes e.g. profiler trace export on exit.
-                result["gen_s"] = time.time() - gen_t0
+                result["gen_s"] = time.perf_counter() - gen_t0
 
             ttft, decode, per_token = _parse_timing(captured)
             result["ttft_ms"] = ttft
@@ -402,7 +402,7 @@ def run_multicard_smoke_test(
                         print(f"  [seq {i}] FAIL checks: {failed}")
                 break  # stop at the first failing run
         except Exception:
-            result["gen_s"] = time.time() - gen_t0
+            result["gen_s"] = time.perf_counter() - gen_t0
             result["error"] = "GENERATE FAILED\n" + traceback.format_exc()
             result["status"] = "ERROR"
             result["iterations"].append(
