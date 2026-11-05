@@ -52,19 +52,26 @@ every run — useful for consistent latency benchmarking::
         scripts/run_multicard_smoke.py --dtype float16 \\
         --max-new-tokens 256 --min-new-tokens 256
 
-Pass ``--with-profiling`` to wrap the timed generate call in
-``torch.profiler.profile`` (CPU + PrivateUse1 activities, shapes, memory).
-Model load, torch.compile and the warmup generate run before the profiler
-starts, so the trace covers steady-state generation only.  Each rank writes a
-TensorBoard trace to ``--trace-dir`` (one ``<hostname>_<pid>.pt.trace.json``
+Pass ``--with-profiling`` to run the timed generate calls under one
+``torch.profiler.profile`` (CPU + PrivateUse1 activities, shapes, memory)
+driven by ``torch.profiler.schedule``: the first ``--profile-warmup`` timed
+runs (default 1) warm the profiler up and are discarded, and the next
+``--profile-active`` (default 5) are recorded into one trace, so
+``--iterations`` must be at least their sum.  Model load, torch.compile and
+the untimed warmup generate run before the profiler starts.  Each rank writes
+a TensorBoard trace to ``--trace-dir`` (one ``<hostname>_<pid>.pt.trace.json``
 per rank); view with ``tensorboard --logdir`` or https://ui.perfetto.dev.
 Profiling adds overhead, so TTFT / ITL from a profiled run are not comparable
 to an unprofiled one::
 
     export SPYRE_DEVICES=0
     torchrun --nproc-per-node=1 --master-port=29500 \\
-        scripts/run_multicard_smoke.py --dtype float16 \\
+        scripts/run_multicard_smoke.py --dtype float16 --iterations 6 \\
         --with-profiling --trace-dir ./spyre_traces
+
+To measure profiling overhead, record each mode with
+``scripts/run_profiling_modes.py`` and compare with
+``scripts/compare_multicard_runs.py``.
 
 The --model argument accepts any HuggingFace repo ID or local path
 (default: ibm-granite/granite-4.2-8b).
@@ -111,6 +118,8 @@ DEFAULT_MODEL = "ibm-granite/granite-4.2-8b"
 DEFAULT_MAX_NEW_TOKENS = 8
 DEFAULT_TRACE_DIR = "./spyre_traces"
 DEFAULT_PROFILE_ROWS = 30
+DEFAULT_PROFILE_WARMUP = 1
+DEFAULT_PROFILE_ACTIVE = 5
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -170,8 +179,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--with-profiling",
         action="store_true",
         help=(
-            "Profile the timed generate call with torch.profiler "
-            "(load, compile and warmup excluded)."
+            "Profile the timed generate runs with torch.profiler on a schedule "
+            "(load, compile and the untimed warmup excluded); needs --iterations "
+            ">= --profile-warmup + --profile-active."
+        ),
+    )
+    parser.add_argument(
+        "--profile-warmup",
+        type=int,
+        default=DEFAULT_PROFILE_WARMUP,
+        metavar="N",
+        help=(
+            "Timed runs that warm the profiler up and are discarded "
+            f"(default: {DEFAULT_PROFILE_WARMUP})."
+        ),
+    )
+    parser.add_argument(
+        "--profile-active",
+        type=int,
+        default=DEFAULT_PROFILE_ACTIVE,
+        metavar="N",
+        help=(
+            "Timed runs recorded into the trace after the warmup "
+            f"(default: {DEFAULT_PROFILE_ACTIVE})."
         ),
     )
     parser.add_argument(
@@ -197,7 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "Append this run's summary to PATH as one JSON line per rank, "
+            "Append one JSON line per rank per timed iteration to PATH, "
             "for comparing runs with scripts/compare_multicard_runs.py."
         ),
     )
@@ -223,8 +253,18 @@ _DTYPE_MAP: dict[str, torch.dtype] = {
 
 
 def main(argv: list[str] | None = None) -> None:
-    wall_t0 = time.time()
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.with_profiling:
+        if args.profile_warmup < 0 or args.profile_active < 1:
+            parser.error("--profile-warmup must be >= 0 and --profile-active >= 1")
+        if args.iterations < args.profile_warmup + args.profile_active:
+            parser.error(
+                f"--with-profiling records timed runs {args.profile_warmup + 1}-"
+                f"{args.profile_warmup + args.profile_active}, so it needs "
+                f"--iterations >= {args.profile_warmup + args.profile_active} "
+                f"(got {args.iterations})"
+            )
     if args.dtype is not None:
         if args.dtype not in _DTYPE_MAP:
             raise ValueError(
@@ -264,6 +304,11 @@ def main(argv: list[str] | None = None) -> None:
         print(f"  Prompt File      : {args.prompt_file}")
         print(
             f"  Profiling        : {args.trace_dir if args.with_profiling else 'off'}"
+            + (
+                f"  (warmup={args.profile_warmup}, active={args.profile_active})"
+                if args.with_profiling
+                else ""
+            )
         )
         print(f"  PROFILE_LEVEL    : {profile_level!r}")
         print("=" * 70)
@@ -303,26 +348,40 @@ def main(argv: list[str] | None = None) -> None:
 
     _conftest.encode_generation_inputs = _encode_and_mark
 
-    # Holds the profiler once generate_ctx() has been called, so its
-    # key_averages() table can be printed after the run.
-    profilers: list = []
+    # One profiler spans every timed run: generate_ctx() starts it on the first
+    # run and steps it after each, so the schedule discards the warmup runs and
+    # records the active ones into a single trace.  The trace is exported
+    # (on_trace_ready) by the step after the last active run, inside
+    # run_multicard_smoke_test and outside its gen_s timing.
+    prof = None
+    prof_started = False
+    if args.with_profiling:
+        from torch.profiler import ProfilerActivity, profile, schedule
 
-    def generate_ctx():
-        phase_t["warmup_end"] = time.time()
-        if not args.with_profiling:
-            return contextlib.nullcontext()
-        from torch.profiler import ProfilerActivity, profile
-
-        # Exits (and on_trace_ready fires) inside run_multicard_smoke_test,
-        # well before the os._exit() below skips all teardown.
         prof = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            schedule=schedule(
+                wait=0,
+                warmup=args.profile_warmup,
+                active=args.profile_active,
+                repeat=1,
+            ),
             record_shapes=True,
             profile_memory=True,
             on_trace_ready=torch.profiler.tensorboard_trace_handler(args.trace_dir),
         )
-        profilers.append(prof)
-        return prof
+
+    @contextlib.contextmanager
+    def generate_ctx():
+        nonlocal prof_started
+        # Entered right before each timed run; only the first ends the warmup.
+        phase_t.setdefault("warmup_end", time.time())
+        if prof is not None and not prof_started:
+            prof.start()
+            prof_started = True
+        yield
+        if prof is not None:
+            prof.step()
 
     result = run_multicard_smoke_test(
         args.model,
@@ -334,6 +393,15 @@ def main(argv: list[str] | None = None) -> None:
         num_iterations=args.iterations,
         generate_ctx=generate_ctx,
     )
+    # Wall clock of the timed runs: from the end of the untimed warmup (the
+    # first generate_ctx() entry) to the return above, so it excludes load and
+    # warmup but includes the per-run checks and the profiler's trace export.
+    # None when load or warmup failed and no timed run started.
+    run_s = time.time() - phase_t["warmup_end"] if "warmup_end" in phase_t else None
+    # Saves a partial trace when a failure cut the active runs short; a no-op
+    # once the schedule has finished.
+    if prof_started:
+        prof.stop()
 
     warmup_s = None
     if "warmup_start" in phase_t and "warmup_end" in phase_t:
@@ -342,7 +410,8 @@ def main(argv: list[str] | None = None) -> None:
     # ── Summary table ──────────────────────────────────────────────────────
     # Each rank builds its summary as one string and writes it atomically.
     # A brief sleep stagger keeps blocks from interleaving in the terminal.
-    def _rank_summary(r: dict, total_s: float) -> str:
+    def _rank_summary(r: dict) -> str:
+        its = r["iterations"]
         lines = [
             "",
             "=" * 70,
@@ -367,8 +436,26 @@ def main(argv: list[str] | None = None) -> None:
             f"  Decode avg : {_fmt(r['decode_ms'], ' ms')}",
             f"  Steady ITL : {_fmt(r['steady_itl_ms'], ' ms')}  (outliers excluded)",
             f"  Output     : {r['output']!r}",
-            f"  Total wall : {_fmt(total_s, 's')}  (main() start to this summary)",
+            f"  Run wall   : {_fmt(run_s, 's')}  (all timed runs; load and warmup excluded)",
         ]
+        # Generate..Steady ITL above are the last timed run; list them all.
+        if len(its) > 1:
+            lines.append(f"  Timed runs : {len(its)}/{args.iterations}")
+            for i, it in enumerate(its):
+                tag = ""
+                if args.with_profiling:
+                    tag = (
+                        "  (profiler warmup)"
+                        if i < args.profile_warmup
+                        else "  (profiled)"
+                        if i < args.profile_warmup + args.profile_active
+                        else ""
+                    )
+                lines.append(
+                    f"    [{i}] {it['status']:<5} gen {_fmt(it['gen_s'], 's')}"
+                    f"  TTFT {_fmt(it['ttft_ms'], ' ms')}"
+                    f"  ITL {_fmt(it['steady_itl_ms'], ' ms')}{tag}"
+                )
         # gen_s is None when load or warmup failed, i.e. the profiler never ran.
         if args.with_profiling and r["gen_s"] is not None:
             lines.append(f"  Trace dir  : {args.trace_dir}")
@@ -379,7 +466,10 @@ def main(argv: list[str] | None = None) -> None:
         return "\n".join(lines)
 
     def _profile_table(prof) -> str:
-        averages = prof.key_averages()
+        try:
+            averages = prof.key_averages()
+        except Exception:  # nothing recorded, e.g. a failure during warmup
+            return ""
         # Sort by Spyre (PrivateUse1) time; fall back to CPU time on torch
         # versions without the device_time fields.
         for sort_by in ("self_device_time_total", "self_cpu_time_total"):
@@ -392,24 +482,24 @@ def main(argv: list[str] | None = None) -> None:
             return ""
         header = (
             f"  PROFILE  [rank {local_rank}/{world_size}]  "
-            f"top {args.profile_rows} ops by {sort_by}"
+            f"top {args.profile_rows} ops by {sort_by}, "
+            f"over {args.profile_active} profiled run(s)"
         )
         return "\n".join(["", "=" * 70, header, "=" * 70, table, ""])
 
     profile_table = ""
-    if profilers and result["gen_s"] is not None and args.profile_rows > 0:
-        profile_table = _profile_table(profilers[-1])
-    # Measured after the profile table is built, so it covers everything this
-    # rank did: load, warmup, generate, trace export and table aggregation.
-    total_s = time.time() - wall_t0
-
+    if prof_started and args.profile_rows > 0:
+        profile_table = _profile_table(prof)
     time.sleep(local_rank * 0.3)
     sys.stdout.write(profile_table)
-    sys.stdout.write(_rank_summary(result, total_s))
+    sys.stdout.write(_rank_summary(result))
     sys.stdout.flush()
 
-    # Every rank writes its own line, after the stagger above, so on multi-card
-    # runs each card's timings are kept and the lines don't interleave.
+    # Every rank writes one line per timed run, after the stagger above, so on
+    # multi-card runs each card's timings are kept and the lines don't
+    # interleave.  Load, warmup and wall times are per process, so they repeat
+    # on each of its lines.  A load or warmup failure, which leaves no timed
+    # run, still gets one line so the failure shows up in the compare.
     if args.results_json:
         label = args.label or (
             f"{args.dtype or 'default'} b{args.batch} "
@@ -417,7 +507,7 @@ def main(argv: list[str] | None = None) -> None:
             + (" prof" if args.with_profiling else "")
             + (f" PROFILE_LEVEL={profile_level}" if profile_level else "")
         )
-        record = {
+        base = {
             "label": label,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "model": args.model,
@@ -431,18 +521,27 @@ def main(argv: list[str] | None = None) -> None:
             "world_size": world_size,
             "rank": local_rank,
             "spyre_devices": spyre_devices,
-            "status": result["status"],
+            "iterations": args.iterations,
+            "profile_warmup": args.profile_warmup if args.with_profiling else None,
+            "profile_active": args.profile_active if args.with_profiling else None,
             "load_s": result["load_s"],
             "warmup_s": warmup_s,
-            "gen_s": result["gen_s"],
-            "ttft_ms": result["ttft_ms"],
-            "decode_ms": result["decode_ms"],
-            "steady_itl_ms": result["steady_itl_ms"],
-            "total_s": total_s,
+            "run_s": run_s,
         }
+        no_run = {
+            "status": result["status"],
+            "gen_s": None,
+            "ttft_ms": None,
+            "decode_ms": None,
+            "steady_itl_ms": None,
+        }
+        records = [
+            {**base, "iteration": i, **it} for i, it in enumerate(result["iterations"])
+        ] or [{**base, "iteration": None, **no_run}]
         try:
             with open(args.results_json, "a") as _f:
-                _f.write(json.dumps(record) + "\n")
+                for record in records:
+                    _f.write(json.dumps(record) + "\n")
         except OSError as e:
             sys.stdout.write(f"\nCould not write --results-json {args.results_json!r}: {e}\n")
         sys.stdout.flush()

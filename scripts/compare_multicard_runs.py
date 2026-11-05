@@ -14,9 +14,19 @@
 
 """Compare runs recorded by ``run_multicard_smoke.py --results-json``.
 
-Runs with the same label are repeats of one config.  Each label's first
-``--skip-first`` runs (default 1, the cold run) are dropped and the rest are
-reduced to their median, so 6 repeats give a median of 5.
+Each JSON line is one timed iteration of one rank.  Lines with the same label
+(and, on multi-card runs, the same rank) are repeats of one config; each is
+reduced to its median after dropping:
+
+- iterations below ``--skip-first`` (default 1) in every process.  On a
+  profiled run that is the profiler's warmup run (``--profile-warmup 1``); on
+  an unprofiled one it is the first timed run, dropped too so both modes are
+  measured over the same iterations;
+- on a profiled run, iterations after the profiler's active window, which
+  ran unprofiled.
+
+Older files without an ``iteration`` field had one line per process; there
+the first ``--skip-first`` lines of each label are dropped instead.
 
 With one file, each label is compared against the first label (or
 ``--baseline LABEL``)::
@@ -26,31 +36,16 @@ With one file, each label is compared against the first label (or
 
 With several files, each file is one code version (e.g. before and after a
 profiling change) and every label is compared against the same label in the
-first file.  To check whether a change adds overhead without the profiler,
-with it, and with ``PROFILE_LEVEL=light``, record each version with
-``scripts/run_profiling_overhead.sh``.  It runs the three modes interleaved,
-6 passes by default (``REPEATS=N`` to change), and writes ``NAME.jsonl``,
-``NAME.log`` and ``traces/NAME_{prof,light}/``; the default labels tell the
-modes apart::
+first file.  Record each version with ``scripts/run_profiling_modes.py``,
+which runs every iteration of one profiling mode before moving to the next::
 
-    bash scripts/run_profiling_overhead.sh before   # on the code without the change
-    # switch the installed packages to the version with the change, then:
-    bash scripts/run_profiling_overhead.sh after
+    python3 scripts/run_profiling_modes.py --out before.jsonl   # old code
+    python3 scripts/run_profiling_modes.py --out after.jsonl    # new code
     python3 scripts/compare_multicard_runs.py before.jsonl after.jsonl
 
-For multi-card runs, list the cards in ``SPYRE_DEVICES``; one rank is
-launched per card and the labels end in ``ws<cards>``, so use the same cards
-for every version::
-
-    SPYRE_DEVICES=0,1 bash scripts/run_profiling_overhead.sh before
-
-Every rank writes its own line (with ``rank`` set), so a multi-card file gets
-one row per card, e.g. ``float16 b16 t128 ws2 prof rank0`` and ``... rank1``;
-each card is compared against the same card in the baseline.
-
-Extra arguments are passed on to every run (e.g. ``... before --batch 4``);
-pass the same ones for every version, and never ``--label``.  The script's
-header lists the rest of its options.
+On multi-card runs every rank writes its own lines, so each card gets its own
+row (e.g. ``float16 b16 t128 ws2 prof rank0`` and ``... rank1``) and is
+compared against the same card in the baseline.
 
 Needs no torch; it can run on a laptop after copying the JSONL off the pod.
 """
@@ -66,7 +61,7 @@ _METRICS = [
     ("ttft_ms", "TTFT ms", "{:.1f}"),
     ("steady_itl_ms", "ITL ms", "{:.1f}"),
     ("gen_s", "Gen s", "{:.2f}"),
-    ("total_s", "Wall s", "{:.1f}"),
+    ("run_s", "Run s", "{:.1f}"),
     ("tok_s", "Tok/s", "{:.1f}"),
 ]
 
@@ -95,8 +90,20 @@ def _key(r: dict) -> str:
     return r["label"]
 
 
+def _measured(r: dict, skip_first: int) -> bool:
+    """Whether a per-iteration line is kept (see the module docstring)."""
+    i = r["iteration"]
+    if i is None:  # load or warmup failed; keep it so the failure shows
+        return True
+    if i < skip_first:
+        return False
+    if r.get("with_profiling") and r.get("profile_active") is not None:
+        return i < (r.get("profile_warmup") or 0) + r["profile_active"]
+    return True
+
+
 def _group(records: list[dict], skip_first: int) -> dict[str, dict]:
-    """Median of each metric per label and rank, after dropping its first runs.
+    """Median of each metric per label and rank, after dropping skipped runs.
 
     Returns rows keyed by label (plus `` rankN`` on multi-card runs), in
     first-seen order.
@@ -109,7 +116,10 @@ def _group(records: list[dict], skip_first: int) -> dict[str, dict]:
 
     rows = {}
     for label, runs in groups.items():
-        kept = runs[skip_first:]
+        if all("iteration" in r for r in runs):
+            kept = [r for r in runs if _measured(r, skip_first)]
+        else:
+            kept = runs[skip_first:]
         if not kept:
             print(
                 f"label {label!r}: only {len(runs)} run(s), all dropped by "
@@ -175,7 +185,10 @@ def main(argv: list[str] | None = None) -> None:
         type=int,
         default=1,
         metavar="N",
-        help="Drop each label's first N runs before taking the median (default: 1).",
+        help=(
+            "Drop iterations below N in every process, or each label's first N "
+            "lines in older files without iterations (default: 1)."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -217,10 +230,13 @@ def main(argv: list[str] | None = None) -> None:
         print(f"\n* baseline ({names[args.results[0]]}).", end="  ")
 
     print(
-        f"Medians after dropping each label's first {args.skip_first} run(s); "
-        "N = kept/total."
+        f"Medians after dropping iterations below {args.skip_first} (and unprofiled "
+        "ones on profiled runs); N = kept/total lines."
     )
-    print("Tok/s = batch / steady ITL (decode throughput).  Wall s includes load and compile.")
+    print(
+        "Tok/s = batch / steady ITL (decode throughput).  Run s = wall clock of "
+        "all timed runs in the process (load and warmup excluded)."
+    )
 
 
 if __name__ == "__main__":
