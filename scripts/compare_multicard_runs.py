@@ -16,7 +16,7 @@
 
 Each JSON line is one timed iteration of one rank.  Lines with the same label
 (and, on multi-card runs, the same rank) are repeats of one config; each is
-reduced to its median after dropping:
+reduced to the mean of its runs after dropping:
 
 - iterations below ``--skip-first`` (default 1) in every process.  On a
   profiled run that is the profiler's warmup run (``--profile-warmup 1``); on
@@ -104,7 +104,7 @@ def _measured(r: dict, skip_first: int) -> bool:
 
 
 def _group(records: list[dict], skip_first: int) -> dict[str, dict]:
-    """Median of each metric per label and rank, after dropping skipped runs.
+    """Mean of each metric per label and rank, after dropping skipped runs.
 
     Returns rows keyed by label (plus `` rankN`` on multi-card runs), in
     first-seen order.
@@ -135,7 +135,7 @@ def _group(records: list[dict], skip_first: int) -> dict[str, dict]:
         }
         for key, _, _ in _METRICS:
             vals = [r[key] for r in kept if r.get(key) is not None]
-            row[key] = statistics.median(vals) if vals else None
+            row[key] = statistics.fmean(vals) if vals else None
         rows[label] = row
     return rows
 
@@ -188,7 +188,8 @@ def main(argv: list[str] | None = None) -> None:
         metavar="N",
         help=(
             "Drop iterations below N in every process, or each label's first N "
-            "lines in older files without iterations (default: 1)."
+            "lines in older files without iterations, before taking the mean "
+            "(default: 1; 0 keeps every run)."
         ),
     )
     args = parser.parse_args(argv)
@@ -231,7 +232,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"\n* baseline ({names[args.results[0]]}).", end="  ")
 
     print(
-        f"Medians after dropping iterations below {args.skip_first} (and unprofiled "
+        f"Means after dropping iterations below {args.skip_first} (and unprofiled "
         "ones on profiled runs); N = kept/total lines."
     )
     print(
