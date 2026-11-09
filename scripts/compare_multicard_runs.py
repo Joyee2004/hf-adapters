@@ -47,6 +47,21 @@ On multi-card runs every rank writes its own lines, so each card gets its own
 row (e.g. ``float16 b16 t128 ws2 prof rank0`` and ``... rank1``) and is
 compared against the same card in the baseline.
 
+With ``run_profiling_modes.py --rounds N`` every line records its round.
+When a file has two or more rounds, a second table follows the main one:
+each round in which a label and its baseline both ran is one paired sample,
+and the table shows the mean difference across rounds with a 95% interval
+(Student's t) and whether it is above, below or within noise of zero::
+
+    python3 scripts/run_profiling_modes.py --out before.jsonl --rounds 4
+    python3 scripts/compare_multicard_runs.py before.jsonl
+
+``--per-round`` also prints one table per round, with each mode's mean
+durations in that round and their % against the baseline in the same round,
+to spot a round that is off from the others::
+
+    python3 scripts/compare_multicard_runs.py before.jsonl --per-round
+
 Needs no torch; it can run on a laptop after copying the JSONL off the pod.
 """
 
@@ -140,6 +155,100 @@ def _group(records: list[dict], skip_first: int) -> dict[str, dict]:
     return rows
 
 
+# Two-sided 95% Student's t by degrees of freedom; 1.96 beyond the table.
+_T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
+        8: 2.306, 9: 2.262, 10: 2.228, 12: 2.179, 15: 2.131, 20: 2.086, 30: 2.042}  # fmt: skip
+
+
+def _t95(df: int) -> float:
+    known = [d for d in _T95 if d <= df]
+    return _T95[max(known)] if known else _T95[1]
+
+
+def _by_round(records: list[dict], skip_first: int) -> dict[str, dict[int, dict]]:
+    """Mean of each metric per label and round: {label: {round: {key: mean}}}."""
+    vals: dict[str, dict[int, dict[str, list]]] = {}
+    for r in records:
+        rnd = r.get("round")
+        if rnd is None or r.get("iteration") is None or not _measured(r, skip_first):
+            continue
+        if r["status"] != "PASS":
+            continue
+        per_round = vals.setdefault(_key(r), {}).setdefault(rnd, {})
+        for key, _, _ in _METRICS:
+            if r.get(key) is not None:
+                per_round.setdefault(key, []).append(r[key])
+    return {
+        label: {rnd: {k: statistics.fmean(v) for k, v in m.items()} for rnd, m in rounds.items()}
+        for label, rounds in vals.items()
+    }
+
+
+def _print_paired(records: list[dict], skip_first: int, base_label: str) -> None:
+    """Paired per-round differences against ``base_label``, if rounds were recorded."""
+    rounds = _by_round(records, skip_first)
+    base_key = next((k for k in rounds if k == base_label), None)
+    if base_key is None or len({r for rs in rounds.values() for r in rs}) < 2:
+        return
+    base = rounds[base_key]
+    # Labels compared against the baseline row for the same card.
+    suffix = base_key[len(base_label.split(" rank")[0]):]
+    others = [k for k in rounds if k != base_key and k.endswith(suffix)]
+    if not others:
+        return
+    keys = [k for k, _, _ in _METRICS if k != "tok_s"]
+    headers = ["Run vs baseline", "Rounds"] + [h for k, h, _ in _METRICS if k in keys]
+    table = [headers]
+    for label in others:
+        cells = [label]
+        common = sorted(set(rounds[label]) & set(base))
+        cells.append(str(len(common)))
+        for key in keys:
+            diffs = [
+                (rounds[label][r][key] / base[r][key] - 1) * 100
+                for r in common
+                if key in rounds[label][r] and base[r].get(key)
+            ]
+            if len(diffs) < 2:
+                cells.append("N/A")
+                continue
+            mean = statistics.fmean(diffs)
+            ci = _t95(len(diffs) - 1) * statistics.stdev(diffs) / len(diffs) ** 0.5
+            verdict = "higher" if mean - ci > 0 else "lower" if mean + ci < 0 else "noise"
+            cells.append(f"{mean:+.2f}% ±{ci:.2f} {verdict}")
+        table.append(cells)
+    print(f"\nPer-round paired difference vs {base_key} (mean ± 95% interval):")
+    widths = [max(len(t[i]) for t in table) for i in range(len(headers))]
+    for i, cells in enumerate(table):
+        print("  ".join(c.ljust(w) for c, w in zip(cells, widths)))
+        if i == 0:
+            print("  ".join("-" * w for w in widths))
+    print(
+        "higher / lower = the whole interval is above / below the baseline; "
+        "noise = the interval includes 0."
+    )
+
+
+def _print_per_round(records: list[dict], skip_first: int, base_label: str) -> None:
+    """One table per recorded round: each label's means, vs the same round's baseline."""
+    rounds = sorted({r["round"] for r in records if r.get("round") is not None})
+    if not rounds:
+        print("\n--per-round: no round recorded in this file (needs --rounds).")
+        return
+    for rnd in rounds:
+        rows = _group([r for r in records if r.get("round") == rnd], skip_first)
+        if not rows:
+            continue
+        base = rows.get(base_label)
+        print(f"\n== round {rnd}" + ("" if base else f"  ({base_label!r} missing; no %)"))
+        _print_table(
+            [
+                (label + (" *" if row is base else ""), row, None if row is base else base)
+                for label, row in rows.items()
+            ]
+        )
+
+
 def _cell(value, fmt: str, base) -> str:
     if value is None:
         return "N/A"
@@ -192,9 +301,18 @@ def main(argv: list[str] | None = None) -> None:
             "(default: 1; 0 keeps every run)."
         ),
     )
+    parser.add_argument(
+        "--per-round",
+        action="store_true",
+        help=(
+            "With one file recorded with --rounds: also print each round's own "
+            "table of mean durations per mode."
+        ),
+    )
     args = parser.parse_args(argv)
 
-    versions = {path: _group(_load(path), args.skip_first) for path in args.results}
+    loaded = {path: _load(path) for path in args.results}
+    versions = {path: _group(recs, args.skip_first) for path, recs in loaded.items()}
     if not any(versions.values()):
         sys.exit("no runs found")
 
@@ -210,10 +328,15 @@ def main(argv: list[str] | None = None) -> None:
                 for label, row in rows.items()
             ]
         )
+        _print_paired(next(iter(loaded.values())), args.skip_first, base_label)
+        if args.per_round:
+            _print_per_round(next(iter(loaded.values())), args.skip_first, base_label)
         print("\n* baseline.", end="  ")
     else:
         if args.baseline is not None:
             sys.exit("--baseline applies to a single file; with several, the first is the baseline")
+        if args.per_round:
+            sys.exit("--per-round applies to a single file")
         base_rows = versions[args.results[0]]
         labels = list(dict.fromkeys(label for rows in versions.values() for label in rows))
         names = {path: os.path.basename(path) for path in args.results}

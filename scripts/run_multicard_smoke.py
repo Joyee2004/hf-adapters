@@ -553,6 +553,10 @@ def main(argv: list[str] | None = None) -> None:
             "rank": local_rank,
             "spyre_devices": spyre_devices,
             "iterations": args.iterations,
+            # Set by scripts/run_profiling_modes.py --rounds; None otherwise.
+            "round": int(os.environ["PROFILING_ROUND"])
+            if os.environ.get("PROFILING_ROUND", "").isdigit()
+            else None,
             "profile_warmup": args.profile_warmup if args.with_profiling else None,
             "profile_active": args.profile_active if args.with_profiling else None,
             "load_s": result["load_s"],

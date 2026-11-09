@@ -15,7 +15,7 @@
 """Record one code version's profiling overhead, one mode at a time.
 
 Runs ``scripts/run_multicard_smoke.py`` under torchrun once per profiling
-mode, finishing every iteration of a mode before starting the next:
+mode per round, finishing every iteration of a mode before starting the next:
 
   off    no profiling
   prof   --with-profiling
@@ -42,9 +42,20 @@ Arguments after ``--`` go to every run_multicard_smoke.py run, and replace
 the defaults below when they repeat one, e.g. ``-- --batch 4``.  Pass the
 same ones for every version, and never ``--label``.
 
-Each run's console output goes to ``<out>.<mode>.log`` and its traces to
-``traces/<out>_<mode>/``.  A mode that fails is recorded with its status and
-the next mode still runs; the exit code is 1 if any mode failed.
+``--rounds N`` interleaves the modes: each round runs every mode once, as its
+own process, and every other round reverses the order (off,prof,light then
+light,prof,off), so each mode gets N independent processes and its average
+position in the session is the same.  That removes the run-order bias and
+the differences between processes that a single block per mode leaves in
+TTFT and ITL.  Every JSON line records its ``round``, so a round with all
+modes can be compared as one paired sample::
+
+    python3 scripts/run_profiling_modes.py --out before.jsonl --rounds 4
+
+Each run's console output goes to ``<out>.<mode>.log`` (``<out>.r<round>.
+<mode>.log`` with ``--rounds``) and its traces to ``traces/<out>_<mode>/``.  A
+run that fails is recorded with its status and the next one still runs; the
+exit code is 1 if any failed.
 """
 
 import argparse
@@ -128,6 +139,16 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--rounds",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Run every mode once per round, reversing the order on every other "
+            "round (default: 1, a single pass in --modes order)."
+        ),
+    )
+    parser.add_argument(
         "--master-port",
         default="29500",
         help="torchrun rendezvous port (default: 29500).",
@@ -145,6 +166,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error(f"unknown mode(s) {unknown}; choose from {list(MODES)}")
     if "--label" in extra or "--iterations" in extra:
         parser.error("pass --iterations to this script, and never --label")
+    if args.rounds < 1:
+        parser.error("--rounds must be >= 1")
 
     os.chdir(_REPO_ROOT)
     # --results-json appends, so old runs would be mixed into the median.
@@ -162,19 +185,29 @@ def main(argv: list[str] | None = None) -> None:
     )
     smoke_args = _merge(DEFAULT_SMOKE_ARGS, extra)
 
+    # Each round runs every mode once; reversing every other round gives each
+    # mode the same average position, so drift over the session cancels.
+    schedule = [
+        (r, mode)
+        for r in range(1, args.rounds + 1)
+        for mode in (modes if r % 2 else modes[::-1])
+    ]
     print(
-        f"{args.out}: modes {', '.join(modes)} x {args.iterations} iterations "
-        f"on SPYRE_DEVICES={spyre_devices} ({nproc} rank(s))",
+        f"{args.out}: modes {', '.join(modes)} x {args.iterations} iterations"
+        + (f", {args.rounds} interleaved rounds" if args.rounds > 1 else "")
+        + f" on SPYRE_DEVICES={spyre_devices} ({nproc} rank(s))",
         flush=True,
     )
     failed = []
-    for mode in modes:
+    for n, (rnd, mode) in enumerate(schedule, 1):
         mode_args, profile_level = MODES[mode]
         # Only the light mode sets it, so an exported value must not leak
         # into the others.
         mode_env = {k: v for k, v in env.items() if k != "PROFILE_LEVEL"}
         if profile_level is not None:
             mode_env["PROFILE_LEVEL"] = profile_level
+        # Read by run_multicard_smoke.py into each JSON line.
+        mode_env["PROFILING_ROUND"] = str(rnd)
         cmd = [
             "torchrun",
             f"--nproc-per-node={nproc}",
@@ -188,8 +221,14 @@ def main(argv: list[str] | None = None) -> None:
         if "--with-profiling" in mode_args:
             cmd += ["--trace-dir", os.path.join(args.trace_root, f"{stem}_{mode}")]
 
-        log_path = f"{stem}.{mode}.log"
-        print(f"\n===== mode {mode}: {' '.join(cmd)}", flush=True)
+        name = f"r{rnd}.{mode}" if args.rounds > 1 else mode
+        log_path = f"{stem}.{name}.log"
+        print(
+            f"\n===== [{n}/{len(schedule)}] "
+            + (f"round {rnd}, " if args.rounds > 1 else "")
+            + f"mode {mode}: {' '.join(cmd)}",
+            flush=True,
+        )
         if profile_level is not None:
             print(f"      PROFILE_LEVEL={profile_level}", flush=True)
         print(f"      log: {log_path}", flush=True)
@@ -202,9 +241,9 @@ def main(argv: list[str] | None = None) -> None:
                 sys.stdout.write(line)
                 log.write(line)
             code = proc.wait()
-        print(f"===== mode {mode}: exit code {code}", flush=True)
+        print(f"===== {name}: exit code {code}", flush=True)
         if code != 0:
-            failed.append(mode)
+            failed.append(name)
 
     lines = 0
     if os.path.exists(args.out):
@@ -212,7 +251,7 @@ def main(argv: list[str] | None = None) -> None:
             lines = sum(1 for line in f if line.strip())
     print(f"\nWrote {args.out} ({lines} lines: one per rank per timed run)")
     if failed:
-        print(f"Failed modes: {', '.join(failed)}; see their logs.")
+        print(f"Failed runs: {', '.join(failed)}; see their logs.")
         sys.exit(1)
 
 
