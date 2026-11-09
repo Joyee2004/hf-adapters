@@ -83,6 +83,16 @@ Options
 --iterations N     timed runs per mode (default 6). Profiled modes need at
                    least --profile-warmup + --profile-active (1 + 5).
 --modes off,prof   which modes to run, in this order (default off,prof,light)
+--rounds N         interleave: run every mode once per round, as its own
+                   process, reversing the order every other round. Use this
+                   for TTFT / ITL: e.g. --rounds 4 gives 4 independent
+                   processes per mode, and the compare adds a paired
+                   per-round table with a 95% interval and a verdict
+                   (higher / lower / noise) for each mode against off.
+                       python3 scripts/run_profiling_modes.py --out before.jsonl --rounds 4 -- --batch 4
+                   Add --per-round to the compare to see each round's own
+                   table of durations, e.g. to spot one round that is off:
+                       python3 scripts/compare_multicard_runs.py before.jsonl --per-round
 --master-port P    torchrun port (default 29500); change it if 29500 is in use
 -- ARGS            passed on to every run_multicard_smoke.py run, replacing a
                    default they repeat, e.g.
