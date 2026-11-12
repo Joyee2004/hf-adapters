@@ -25,7 +25,7 @@ Each mode is one process that loads and compiles once, then does
 ``--iterations`` timed generate runs (default 6: with ``--with-profiling`` the
 first warms the profiler up and the next 5 are recorded, via
 ``torch.profiler.schedule``).  Every rank appends one JSON line per timed run
-to ``--out``, and ``scripts/compare_multicard_runs.py`` takes the median per
+to ``--out``, and ``scripts/compare_multicard_runs.py`` takes the mean per
 mode::
 
     python3 scripts/run_profiling_modes.py --out before.jsonl   # old code
@@ -53,7 +53,13 @@ modes can be compared as one paired sample::
     python3 scripts/run_profiling_modes.py --out before.jsonl --rounds 4
 
 Each run's console output goes to ``<out>.<mode>.log`` (``<out>.r<round>.
-<mode>.log`` with ``--rounds``) and its traces to ``traces/<out>_<mode>/``.  A
+<mode>.log`` with ``--rounds``) and its traces to ``<trace-root>/<out>_<mode>/``
+(``--trace-root`` defaults to ``/tmp/spyre_traces``, on the pod's local disk:
+trace export time depends heavily on the filesystem, and on a network or
+shared one it varies from run to run, more so with several ranks writing at
+once; copy the traces off afterwards).  Before every mode the runner calls
+``sync``, so trace data still being written to disk from the previous mode
+cannot slow the next one.  A
 run that fails is recorded with its status and the next one still runs; the
 exit code is 1 if any failed.
 """
@@ -62,9 +68,13 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SMOKE = os.path.join("scripts", "run_multicard_smoke.py")
+# Local disk on the pod, so trace export time isn't set by a network or
+# shared filesystem.
+_DEFAULT_TRACE_ROOT = "/tmp/spyre_traces"
 
 # mode -> (extra smoke-script args, PROFILE_LEVEL or None)
 MODES = {
@@ -155,8 +165,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--trace-root",
-        default="traces",
-        help="Directory for per-mode trace subdirectories (default: traces).",
+        default=_DEFAULT_TRACE_ROOT,
+        help=(
+            "Directory for per-mode trace subdirectories; keep it on local "
+            f"disk (default: {_DEFAULT_TRACE_ROOT})."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -170,7 +183,7 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--rounds must be >= 1")
 
     os.chdir(_REPO_ROOT)
-    # --results-json appends, so old runs would be mixed into the median.
+    # --results-json appends, so old runs would be mixed into the mean.
     if os.path.exists(args.out):
         sys.exit(f"{args.out} already exists; delete it or pick another name")
 
@@ -232,9 +245,20 @@ def main(argv: list[str] | None = None) -> None:
         if profile_level is not None:
             print(f"      PROFILE_LEVEL={profile_level}", flush=True)
         print(f"      log: {log_path}", flush=True)
+        # Flush everything still waiting to be written to disk, mostly the
+        # previous mode's traces, so that writeback can't slow this mode's
+        # load, warmup or timed runs.  Done before every mode, the first too,
+        # so a set never starts with another set's data still being written.
+        sync_t0 = time.perf_counter()
+        os.sync()
+        print(f"      sync: {time.perf_counter() - sync_t0:.1f}s", flush=True)
         with open(log_path, "w") as log:
             proc = subprocess.Popen(
-                cmd, env=mode_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+                cmd,
+                env=mode_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
             )
             assert proc.stdout is not None
             for line in proc.stdout:

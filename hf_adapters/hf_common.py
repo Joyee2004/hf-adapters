@@ -3213,7 +3213,7 @@ def generate(
     generated_columns = []
 
     for i in range(effective_max_new_tokens):
-        t0 = time.time()
+        t0 = time.perf_counter()
 
         if i == 0:
             # --- PREFILL ---
@@ -3368,7 +3368,7 @@ def generate(
         if collect_scores:
             generation_scores.append(processed_scores)
         if timing:
-            times_list.append(time.time() - t0)
+            times_list.append(time.perf_counter() - t0)
 
         # Finished rows emit padding while unfinished rows continue. Mask using
         # the previous state so the first EOS token remains in the output.
