@@ -1,7 +1,8 @@
 Profiling overhead test: before vs after changes
 ================================================
 
-Measures TTFT, steady ITL, Gen s and the per-run wall clock for three modes:
+Measures TTFT, steady ITL, Gen s, the per-run wall clock and the trace export
+time for three modes:
   off    no profiling
   prof   --with-profiling
   light  --with-profiling + PROFILE_LEVEL=light
@@ -94,6 +95,9 @@ Options
                    table of durations, e.g. to spot one round that is off:
                        python3 scripts/compare_multicard_runs.py before.jsonl --per-round
 --master-port P    torchrun port (default 29500); change it if 29500 is in use
+--trace-root DIR   where the per-mode trace directories go (default
+                   /tmp/spyre_traces, local disk). Keep it off network or
+                   shared filesystems, where export time varies run to run.
 -- ARGS            passed on to every run_multicard_smoke.py run, replacing a
                    default they repeat, e.g.
                        python3 scripts/run_profiling_modes.py --out before.jsonl -- --batch 4
@@ -109,7 +113,7 @@ the prof mode on 2 cards:
     SPYRE_DEVICES=0,1 torchrun --nproc-per-node=2 --master-port=29500 scripts/run_multicard_smoke.py \
         --dtype float16 --prompt-file scripts/prompts.txt --batch 16 \
         --max-new-tokens 128 --min-new-tokens 128 --iterations 6 \
-        --with-profiling --trace-dir traces/before_prof --results-json before.jsonl
+        --with-profiling --trace-dir /tmp/spyre_traces/before_prof --results-json before.jsonl
 
 
 Output of each set (OUT = before.jsonl, ...; NAME = before, ...)
@@ -123,8 +127,12 @@ OUT                one line per rank per timed run: 18 lines on 1 card (3
                    With 2 / 4 cards the labels end in ws2 / ws4, and the
                    compare shows one row per card (... rank0, ... rank1).
 NAME.<mode>.log    console output of each mode, every rank's summary
-traces/NAME_prof/  one trace per rank, covering timed runs 1-5
-traces/NAME_light/ the same for the light mode
+/tmp/spyre_traces/NAME_prof/   one trace per rank, covering timed runs 1-5
+/tmp/spyre_traces/NAME_light/  the same for the light mode
+                   Traces go to local disk by default (--trace-root to
+                   change it): export time depends on the filesystem. Copy
+                   them off before the pod restarts, e.g.
+                     kubectl cp $NS/$POD:/tmp/spyre_traces ./spyre_traces
 
 
 Notes
@@ -135,25 +143,42 @@ Notes
   --iterations 1) to check it loads.
 - Batch: 16 by default. Batch 64 fails to compile: prefill builds a
   [batch, 512, 100352] float16 logits buffer, 784 MB per core at batch 64.
+- The runner calls sync before every mode (its time is printed as
+  "sync: N s"), so trace data still being flushed to disk from the previous
+  mode can't slow the next one.
 - A mode that fails is recorded with its status and the next mode still runs;
   the runner exits 1 if any mode failed.
 - The runner refuses to overwrite: if OUT exists, delete it or pick another
-  name. Old runs would otherwise be mixed into the median.
+  name. Old runs would otherwise be mixed into the mean.
 - Don't pass --label (before/after are matched by the default label).
 - The compare drops timed run 0 of every mode (the profiler's warmup; also
-  dropped for off so all modes cover the same runs) and takes the median of
-  runs 1-5. Keep the iteration counts the same for every version.
+  dropped for off so all modes cover the same runs) and takes the mean of
+  runs 1-5. Keep the iteration counts and the profiler window the same for
+  every version: the export is spread over the profiled runs (below), so
+  Wall s overhead depends on how many there are.
 - Each mode is one process, so Load and Warmup are measured once per mode and
   repeated on its lines. Gen s, Wall s, Wall-exp s, TTFT and ITL are per timed
-  run, and the compare shows their median over runs 1-5. Wall s is a run's
-  wall clock from its start to the next run's start: generate, the profiler
-  step, any trace export and the output checks. Wall-exp s is Wall s minus the
-  trace export.
-- The trace is exported once, at the end of the last profiled run (run 5), so
-  only that run's Wall s carries it, and the median of 5 leaves it out. The
-  per-run list in each mode's log shows it, and so does "Export" in the
-  summary.
-- With a median of 5, treat differences of about 1-2% as noise. Modes run one
-  after another, so node noise that comes and goes can land on one mode only;
-  if a difference looks suspicious, repeat the set with --modes in another
-  order.
+  run, and the compare shows their mean over runs 1-5. Wall s is a run's
+  wall clock from its start to the start of the next one: generate, the
+  profiler step (including any export) and the output checks.
+- Export s is the whole profiler step that closes the window after run 5:
+  stopping the profiler, parsing its events and writing the trace. It is
+  shown once per trace (summed over the process's runs), not per run. Only
+  run 5's Wall s carries it, so the mean Wall s of a profiled mode includes
+  Export s / 5; Wall-exp s is Wall s minus the export. Report Wall s for the
+  full wall clock including the export, and Export s on its own.
+- Before every timed run, in every mode, the script runs gc.collect() and
+  disables garbage collection until the run's generate and profiler step are
+  done, so a collection pause can't land at a random token. On multi-card
+  runs all ranks then meet at a barrier, so every run starts on all cards at
+  once. Neither the collect nor the barrier is in any measured time.
+- On multi-card runs the compare adds a "... max" row per mode: for every
+  run, the slowest card's value of each metric. Use it for the job's wall
+  clock and export: a TP run is only done when its last card is.
+- Per-token times (TTFT, ITL) use time.perf_counter(), a monotonic clock.
+  Older files were recorded with time.time(); record before and after with
+  the same code.
+- Treat single differences of about 1-2% as noise. Modes run one after
+  another, so node noise that comes and goes can land on one mode only. Use
+  --rounds 4 or more and read the paired table, which says whether a
+  difference is outside noise.

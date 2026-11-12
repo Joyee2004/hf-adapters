@@ -45,7 +45,17 @@ which runs every iteration of one profiling mode before moving to the next::
 
 On multi-card runs every rank writes its own lines, so each card gets its own
 row (e.g. ``float16 b16 t128 ws2 prof rank0`` and ``... rank1``) and is
-compared against the same card in the baseline.
+compared against the same card in the baseline.  A ``... max`` row follows
+them: for every timed run it takes the slowest rank's value of each metric,
+since a tensor-parallel run is only done when its last card is.
+
+``Export s`` is the profiler's export per trace: the whole ``prof.step()``
+that closes the active window (profiler stop, event parsing and trace write).
+It is summed over a process's kept runs, so it counts one trace and doesn't
+shrink with the number of profiled runs, and then averaged over processes
+(rounds).  ``Wall s`` stays a per-run mean, so on a profiled mode it carries
+the export divided by the number of profiled runs; ``Wall-exp s`` leaves it
+out.
 
 With ``run_profiling_modes.py --rounds N`` every line records its round.
 When a file has two or more rounds, a second table follows the main one:
@@ -78,8 +88,14 @@ _METRICS = [
     ("gen_s", "Gen s", "{:.3f}"),
     ("wall_s", "Wall s", "{:.3f}"),
     ("wall_noexport_s", "Wall-exp s", "{:.3f}"),
+    ("export_s", "Export s", "{:.3f}"),
     ("tok_s", "Tok/s", "{:.3f}"),
 ]
+
+
+# Summed over each process's kept runs (one trace per process), then averaged
+# over processes; every other metric is a mean over the kept runs.
+_PER_TRACE = {"export_s"}
 
 
 def _load(path: str) -> list[dict]:
@@ -96,14 +112,82 @@ def _load(path: str) -> list[dict]:
     return records
 
 
-def _key(r: dict) -> str:
-    """Label, plus the rank on multi-card runs so each card gets its own row.
+def _suffix(r: dict) -> str:
+    """`` rankN`` (or `` max``) on multi-card runs, else empty.
 
     Records written before ranks were recorded came from rank 0 only.
     """
-    if r.get("world_size", 1) > 1:
-        return f"{r['label']} rank{r.get('rank', 0)}"
-    return r["label"]
+    if r.get("world_size", 1) <= 1:
+        return ""
+    rank = r.get("rank", 0)
+    return " max" if rank == "max" else f" rank{rank}"
+
+
+def _key(r: dict) -> str:
+    """Label, plus the rank on multi-card runs so each card gets its own row."""
+    return r["label"] + _suffix(r)
+
+
+def _process(r: dict) -> tuple:
+    """Which process wrote a line: each process stamps all its lines alike."""
+    return (r.get("round"), r.get("timestamp"))
+
+
+def _add_rank_max(records: list[dict]) -> list[dict]:
+    """Append, per multi-card label, one ``max`` line per timed run.
+
+    Each rank writes its lines in the same order (process by process, run by
+    run), so the n-th line of every rank is the same run; its ``max`` line
+    takes the slowest rank's value of every metric.  A label whose ranks
+    don't line up (a rank missing lines) gets no ``max`` lines.
+    """
+    by_label: dict[str, dict[int, list[dict]]] = {}
+    for r in records:
+        if r.get("world_size", 1) > 1 and r.get("rank") != "max":
+            by_label.setdefault(r["label"], {}).setdefault(r.get("rank", 0), []).append(
+                r
+            )
+    out = list(records)
+    for label, ranks in by_label.items():
+        lines = list(ranks.values())
+        if len(lines) < 2:
+            continue
+        aligned = len({len(ls) for ls in lines}) == 1 and all(
+            len({(x.get("iteration"), x.get("round")) for x in run}) == 1
+            for run in zip(*lines)
+        )
+        if not aligned:
+            print(f"label {label!r}: ranks don't line up; no max row", file=sys.stderr)
+            continue
+        for run in zip(*lines):
+            m = dict(run[0], rank="max")
+            statuses = {x["status"] for x in run}
+            m["status"] = (
+                "PASS"
+                if statuses == {"PASS"}
+                else "/".join(sorted(statuses - {"PASS"}))
+            )
+            for key in [k for k, _, _ in _METRICS if k != "tok_s"]:
+                vals = [x[key] for x in run if x.get(key) is not None]
+                m[key] = max(vals) if vals else None
+            out.append(m)
+    return out
+
+
+def _aggregate(kept: list[dict]) -> dict:
+    """Each metric over the kept lines of one row (see ``_PER_TRACE``)."""
+    agg = {}
+    for key, _, _ in _METRICS:
+        if key in _PER_TRACE:
+            per_proc: dict[tuple, float] = {}
+            for r in kept:
+                if r.get(key) is not None:
+                    per_proc[_process(r)] = per_proc.get(_process(r), 0.0) + r[key]
+            agg[key] = statistics.fmean(per_proc.values()) if per_proc else None
+        else:
+            vals = [r[key] for r in kept if r.get(key) is not None]
+            agg[key] = statistics.fmean(vals) if vals else None
+    return agg
 
 
 def _measured(r: dict, skip_first: int) -> bool:
@@ -145,12 +229,12 @@ def _group(records: list[dict], skip_first: int) -> dict[str, dict]:
             continue
         row = {
             "label": label,
+            "name": runs[0]["label"],
+            "suffix": _suffix(runs[0]),
             "runs": f"{len(kept)}/{len(runs)}",
             "status": "/".join(sorted({r["status"] for r in kept})),
         }
-        for key, _, _ in _METRICS:
-            vals = [r[key] for r in kept if r.get(key) is not None]
-            row[key] = statistics.fmean(vals) if vals else None
+        row.update(_aggregate(kept))
         rows[label] = row
     return rows
 
@@ -166,40 +250,60 @@ def _t95(df: int) -> float:
 
 
 def _by_round(records: list[dict], skip_first: int) -> dict[str, dict[int, dict]]:
-    """Mean of each metric per label and round: {label: {round: {key: mean}}}."""
-    vals: dict[str, dict[int, dict[str, list]]] = {}
+    """Each metric per label and round: {label: {round: {key: value}}}."""
+    kept: dict[str, dict[int, list[dict]]] = {}
     for r in records:
         rnd = r.get("round")
         if rnd is None or r.get("iteration") is None or not _measured(r, skip_first):
             continue
         if r["status"] != "PASS":
             continue
-        per_round = vals.setdefault(_key(r), {}).setdefault(rnd, {})
-        for key, _, _ in _METRICS:
-            if r.get(key) is not None:
-                per_round.setdefault(key, []).append(r[key])
+        kept.setdefault(_key(r), {}).setdefault(rnd, []).append(r)
     return {
-        label: {rnd: {k: statistics.fmean(v) for k, v in m.items()} for rnd, m in rounds.items()}
-        for label, rounds in vals.items()
+        label: {
+            rnd: {k: v for k, v in _aggregate(rs).items() if v is not None}
+            for rnd, rs in rounds.items()
+        }
+        for label, rounds in kept.items()
     }
 
 
-def _print_paired(records: list[dict], skip_first: int, base_label: str) -> None:
-    """Paired per-round differences against ``base_label``, if rounds were recorded."""
+def _base_name(rows: dict[str, dict], base_label: str) -> str:
+    """The baseline's label without its rank, so each card has its own baseline."""
+    row = rows.get(base_label)
+    return row["name"] if row else base_label
+
+
+def _vs_base(
+    rows: dict[str, dict], base_name: str
+) -> list[tuple[str, dict, dict | None]]:
+    """(name, row, baseline row) per row; the baseline is the same card's row."""
+    out = []
+    for label, row in rows.items():
+        is_base = row["name"] == base_name
+        base = None if is_base else rows.get(base_name + row["suffix"])
+        out.append((label + (" *" if is_base else ""), row, base))
+    return out
+
+
+def _print_paired(records: list[dict], skip_first: int, base_name: str) -> None:
+    """Paired per-round differences against ``base_name``, if rounds were recorded."""
     rounds = _by_round(records, skip_first)
-    base_key = next((k for k in rounds if k == base_label), None)
-    if base_key is None or len({r for rs in rounds.values() for r in rs}) < 2:
+    if len({r for rs in rounds.values() for r in rs}) < 2:
         return
-    base = rounds[base_key]
-    # Labels compared against the baseline row for the same card.
-    suffix = base_key[len(base_label.split(" rank")[0]):]
-    others = [k for k in rounds if k != base_key and k.endswith(suffix)]
-    if not others:
+    suffix_of = {_key(r): _suffix(r) for r in records}
+    # Each label is compared against the baseline row for the same card.
+    pairs = []
+    for k in rounds:
+        base_key = base_name + suffix_of[k]
+        if k != base_key and base_key in rounds:
+            pairs.append((k, rounds[base_key]))
+    if not pairs:
         return
     keys = [k for k, _, _ in _METRICS if k != "tok_s"]
     headers = ["Run vs baseline", "Rounds"] + [h for k, h, _ in _METRICS if k in keys]
     table = [headers]
-    for label in others:
+    for label, base in pairs:
         cells = [label]
         common = sorted(set(rounds[label]) & set(base))
         cells.append(str(len(common)))
@@ -214,10 +318,15 @@ def _print_paired(records: list[dict], skip_first: int, base_label: str) -> None
                 continue
             mean = statistics.fmean(diffs)
             ci = _t95(len(diffs) - 1) * statistics.stdev(diffs) / len(diffs) ** 0.5
-            verdict = "higher" if mean - ci > 0 else "lower" if mean + ci < 0 else "noise"
+            verdict = (
+                "higher" if mean - ci > 0 else "lower" if mean + ci < 0 else "noise"
+            )
             cells.append(f"{mean:+.2f}% ±{ci:.2f} {verdict}")
         table.append(cells)
-    print(f"\nPer-round paired difference vs {base_key} (mean ± 95% interval):")
+    print(
+        f"\nPer-round paired difference vs {base_name} on the same card "
+        "(mean ± 95% interval):"
+    )
     widths = [max(len(t[i]) for t in table) for i in range(len(headers))]
     for i, cells in enumerate(table):
         print("  ".join(c.ljust(w) for c, w in zip(cells, widths)))
@@ -229,7 +338,7 @@ def _print_paired(records: list[dict], skip_first: int, base_label: str) -> None
     )
 
 
-def _print_per_round(records: list[dict], skip_first: int, base_label: str) -> None:
+def _print_per_round(records: list[dict], skip_first: int, base_name: str) -> None:
     """One table per recorded round: each label's means, vs the same round's baseline."""
     rounds = sorted({r["round"] for r in records if r.get("round") is not None})
     if not rounds:
@@ -239,14 +348,12 @@ def _print_per_round(records: list[dict], skip_first: int, base_label: str) -> N
         rows = _group([r for r in records if r.get("round") == rnd], skip_first)
         if not rows:
             continue
-        base = rows.get(base_label)
-        print(f"\n== round {rnd}" + ("" if base else f"  ({base_label!r} missing; no %)"))
-        _print_table(
-            [
-                (label + (" *" if row is base else ""), row, None if row is base else base)
-                for label, row in rows.items()
-            ]
+        has_base = any(row["name"] == base_name for row in rows.values())
+        print(
+            f"\n== round {rnd}"
+            + ("" if has_base else f"  ({base_name!r} missing; no %)")
         )
+        _print_table(_vs_base(rows, base_name))
 
 
 def _cell(value, fmt: str, base) -> str:
@@ -265,7 +372,8 @@ def _print_table(rows: list[tuple[str, dict, dict | None]]) -> None:
     for name, row, base in rows:
         cells = [name, row["runs"], row["status"]]
         cells += [
-            _cell(row[key], fmt, base[key] if base else None) for key, _, fmt in _METRICS
+            _cell(row[key], fmt, base[key] if base else None)
+            for key, _, fmt in _METRICS
         ]
         table.append(cells)
 
@@ -311,34 +419,33 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    loaded = {path: _load(path) for path in args.results}
+    loaded = {path: _add_rank_max(_load(path)) for path in args.results}
     versions = {path: _group(recs, args.skip_first) for path, recs in loaded.items()}
     if not any(versions.values()):
         sys.exit("no runs found")
 
     if len(versions) == 1:
         rows = next(iter(versions.values()))
-        base_label = args.baseline or next(iter(rows))
-        if base_label not in rows:
-            sys.exit(f"baseline {base_label!r} not found; labels: {list(rows)}")
-        base = rows[base_label]
-        _print_table(
-            [
-                (label + (" *" if row is base else ""), row, None if row is base else base)
-                for label, row in rows.items()
-            ]
-        )
-        _print_paired(next(iter(loaded.values())), args.skip_first, base_label)
+        # --baseline may name the label with or without a card (`` rank0``).
+        base_name = _base_name(rows, args.baseline or next(iter(rows)))
+        if not any(row["name"] == base_name for row in rows.values()):
+            sys.exit(f"baseline {base_name!r} not found; labels: {list(rows)}")
+        _print_table(_vs_base(rows, base_name))
+        _print_paired(next(iter(loaded.values())), args.skip_first, base_name)
         if args.per_round:
-            _print_per_round(next(iter(loaded.values())), args.skip_first, base_label)
+            _print_per_round(next(iter(loaded.values())), args.skip_first, base_name)
         print("\n* baseline.", end="  ")
     else:
         if args.baseline is not None:
-            sys.exit("--baseline applies to a single file; with several, the first is the baseline")
+            sys.exit(
+                "--baseline applies to a single file; with several, the first is the baseline"
+            )
         if args.per_round:
             sys.exit("--per-round applies to a single file")
         base_rows = versions[args.results[0]]
-        labels = list(dict.fromkeys(label for rows in versions.values() for label in rows))
+        labels = list(
+            dict.fromkeys(label for rows in versions.values() for label in rows)
+        )
         names = {path: os.path.basename(path) for path in args.results}
         for label in labels:
             print(f"\n== {label}")
@@ -349,7 +456,11 @@ def main(argv: list[str] | None = None) -> None:
                     continue
                 is_base = path == args.results[0]
                 table.append(
-                    (names[path] + (" *" if is_base else ""), rows[label], None if is_base else base)
+                    (
+                        names[path] + (" *" if is_base else ""),
+                        rows[label],
+                        None if is_base else base,
+                    )
                 )
             _print_table(table)
         print(f"\n* baseline ({names[args.results[0]]}).", end="  ")
@@ -360,8 +471,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(
         "Tok/s = batch / steady ITL (decode throughput).  Wall s = per-run wall "
-        "clock (generate, profiler step and trace export, output checks); "
-        "Wall-exp s = Wall s minus the trace export."
+        "clock (generate, profiler step incl. any export, output checks); "
+        "Wall-exp s = Wall s minus the export.  Export s = profiler stop, event "
+        "parsing and trace write, once per trace (summed over a process's runs).  "
+        "On multi-card runs, `max` = the slowest card per run."
     )
 
 

@@ -61,13 +61,24 @@ runs (default 1) warm the profiler up and are discarded, and the next
 the untimed warmup generate run before the profiler starts.  Each rank writes
 a TensorBoard trace to ``--trace-dir`` (one ``<hostname>_<pid>.pt.trace.json``
 per rank); view with ``tensorboard --logdir`` or https://ui.perfetto.dev.
-Profiling adds overhead, so TTFT / ITL from a profiled run are not comparable
-to an unprofiled one::
+Closing the active window stops the profiler, parses its events and writes
+the trace; that whole ``prof.step()`` is timed as the run's export
+(``export_s``).  Profiling adds overhead, so TTFT / ITL from a profiled run
+are not comparable to an unprofiled one::
 
     export SPYRE_DEVICES=0
     torchrun --nproc-per-node=1 --master-port=29500 \\
         scripts/run_multicard_smoke.py --dtype float16 --iterations 6 \\
         --with-profiling --trace-dir ./spyre_traces
+
+Every timed run, profiled or not, starts the same way: a ``gc.collect()``,
+then garbage collection is disabled until the run's generate and profiler
+step are done, so a collection pause can't land at a random token (profiling
+creates far more Python objects than an unprofiled run).  On multi-card runs
+all ranks then meet at a ``dist.barrier()``, so each run starts on every card
+at once and no rank's TTFT or wall clock includes waiting for another rank to
+finish the previous run.  The collect and the barrier are outside every
+measured time.
 
 To measure profiling overhead, record each mode with
 ``scripts/run_profiling_modes.py`` and compare with
@@ -96,6 +107,7 @@ summary shows ``Status: PASS`` the test passed.
 
 import argparse
 import contextlib
+import gc
 import json
 import os
 import sys
@@ -350,29 +362,30 @@ def main(argv: list[str] | None = None) -> None:
 
     # One profiler spans every timed run: generate_ctx() starts it on the first
     # run and steps it after each, so the schedule discards the warmup runs and
-    # records the active ones into a single trace.  The trace is exported
-    # (on_trace_ready) by the step after the last active run, inside
-    # run_multicard_smoke_test and outside its gen_s timing; the export is
-    # timed on its own and charged to the timed run it happened in, so each
-    # run's wall clock can be shown with and without it.
+    # records the active ones into a single trace.  The step after the last
+    # active run closes the window: it stops the profiler, parses its events
+    # and calls on_trace_ready to write the trace.  That whole step is timed
+    # and charged to the run it ends as export_s, so each run's wall clock can
+    # be shown with and without it.  Timing only the trace write would leave
+    # the stop and the event parsing, usually the larger part, in the run.
     prof = None
     prof_started = False
-    # Per timed run: wall-clock start, and trace-export seconds inside it.
+    distributed = world_size > 1 and dist.is_available()
+    # Per timed run: wall-clock start and end, seconds in the prof.step()
+    # after it, and that step's time again when it exported the trace.
     run_starts: list[float] = []
+    run_ends: list[float] = []
+    run_steps: list[float] = []
     run_exports: list[float] = []
-    runs_done = False  # set once the last run's wall clock has ended
-    export_s: float | None = None  # every export, incl. one after the last run
+    export_s: float | None = None  # every export, incl. one by prof.stop() below
+    trace_ready = False  # set by on_trace_ready, checked after each step / stop
     if args.with_profiling:
         write_trace = torch.profiler.tensorboard_trace_handler(args.trace_dir)
 
         def on_trace_ready(p) -> None:
-            nonlocal export_s
-            t0 = time.perf_counter()
+            nonlocal trace_ready
+            trace_ready = True
             write_trace(p)
-            dt = time.perf_counter() - t0
-            export_s = (export_s or 0.0) + dt
-            if run_exports and not runs_done:
-                run_exports[-1] += dt
 
         from torch.profiler import ProfilerActivity, profile, schedule
 
@@ -389,23 +402,44 @@ def main(argv: list[str] | None = None) -> None:
             on_trace_ready=on_trace_ready,
         )
 
+    def _end_run() -> None:
+        """End the wall clock of the run in progress, if there is one."""
+        if len(run_ends) < len(run_starts):
+            run_ends.append(time.perf_counter())
+
     @contextlib.contextmanager
     def generate_ctx():
-        nonlocal prof_started
+        nonlocal prof_started, trace_ready, export_s
         # Entered right before each timed run; the first ends the warmup.  A
-        # run's wall clock lasts until the next run starts (or, for the last,
-        # until run_multicard_smoke_test returns), so it covers generate, the
-        # profiler step and export after it, and the output checks.
-        now = time.perf_counter()
-        phase_t.setdefault("warmup_end", now)
-        run_starts.append(now)
-        run_exports.append(0.0)
-        if prof is not None and not prof_started:
-            prof.start()
-            prof_started = True
-        yield
-        if prof is not None:
-            prof.step()
+        # run's wall clock lasts until the next run is entered (or, for the
+        # last, until run_multicard_smoke_test returns), so it covers
+        # generate, the profiler step and any export after it, and the output
+        # checks -- but not the gc.collect() and barrier below.
+        _end_run()
+        phase_t.setdefault("warmup_end", time.perf_counter())
+        gc.collect()
+        gc.disable()
+        try:
+            if distributed and dist.is_initialized():
+                dist.barrier()
+            run_starts.append(time.perf_counter())
+            run_steps.append(0.0)
+            run_exports.append(0.0)
+            if prof is not None and not prof_started:
+                prof.start()
+                prof_started = True
+            yield
+            if prof is not None:
+                trace_ready = False
+                t0 = time.perf_counter()
+                prof.step()
+                dt = time.perf_counter() - t0
+                run_steps[-1] = dt
+                if trace_ready:
+                    run_exports[-1] = dt
+                    export_s = (export_s or 0.0) + dt
+        finally:
+            gc.enable()
 
     result = run_multicard_smoke_test(
         args.model,
@@ -417,17 +451,22 @@ def main(argv: list[str] | None = None) -> None:
         num_iterations=args.iterations,
         generate_ctx=generate_ctx,
     )
-    # Taken before prof.stop(): an export it triggers belongs to no run.
-    run_ends = run_starts[1:] + [time.perf_counter()]
-    runs_done = True
+    _end_run()
     run_walls = [end - start for start, end in zip(run_starts, run_ends)]
     # Saves a partial trace when a failure cut the active runs short; a no-op
-    # once the schedule has finished.  Counted in export_s only.
+    # once the schedule has finished.  Belongs to no run: counted in export_s.
     if prof_started:
+        trace_ready = False
+        t0 = time.perf_counter()
         prof.stop()
+        if trace_ready:
+            export_s = (export_s or 0.0) + time.perf_counter() - t0
     # One entry per run that started; result["iterations"] has the same runs.
-    for it, wall, exp in zip(result["iterations"], run_walls, run_exports):
+    for it, wall, step, exp in zip(
+        result["iterations"], run_walls, run_steps, run_exports
+    ):
         it["wall_s"] = wall
+        it["prof_step_s"] = step if args.with_profiling else None
         it["export_s"] = exp if args.with_profiling else None
         it["wall_noexport_s"] = wall - exp
 
@@ -474,21 +513,31 @@ def main(argv: list[str] | None = None) -> None:
                     tag = (
                         "  (profiler warmup)"
                         if i < args.profile_warmup
-                        else "  (profiled)"
-                        if i < args.profile_warmup + args.profile_active
-                        else ""
+                        else (
+                            "  (profiled)"
+                            if i < args.profile_warmup + args.profile_active
+                            else ""
+                        )
                     )
                 lines.append(
                     f"    [{i}] {it['status']:<5} gen {_fmt(it['gen_s'], 's')}"
                     f"  wall {_fmt(it.get('wall_s'), 's')}"
                     f"  wall-exp {_fmt(it.get('wall_noexport_s'), 's')}"
-                    f"  TTFT {_fmt(it['ttft_ms'], ' ms')}"
+                    + (
+                        f"  export {_fmt(it.get('export_s'), 's')}"
+                        if args.with_profiling
+                        else ""
+                    )
+                    + f"  TTFT {_fmt(it['ttft_ms'], ' ms')}"
                     f"  ITL {_fmt(it['steady_itl_ms'], ' ms')}{tag}"
                 )
         # gen_s is None when load or warmup failed, i.e. the profiler never ran.
         if args.with_profiling and r["gen_s"] is not None:
             lines.append(f"  Trace dir  : {args.trace_dir}")
-            lines.append(f"  Export     : {_fmt(export_s, 's')}  (writing the trace, all runs)")
+            lines.append(
+                f"  Export     : {_fmt(export_s, 's')}  "
+                "(profiler stop, event parsing and trace write; all runs)"
+            )
         if r["error"]:
             lines += ["", "  ERROR DETAIL:"]
             lines += [f"    {line}" for line in r["error"].splitlines()]
@@ -528,9 +577,10 @@ def main(argv: list[str] | None = None) -> None:
     # Every rank writes one line per timed run, after the stagger above, so on
     # multi-card runs each card's timings are kept and the lines don't
     # interleave.  Load and warmup are per process, so they repeat on each of
-    # its lines; wall_s and wall_noexport_s are per run.  A load or warmup
-    # failure, which leaves no timed
-    # run, still gets one line so the failure shows up in the compare.
+    # its lines; wall_s, wall_noexport_s, prof_step_s and export_s are per run
+    # (export_s is nonzero only on the run that closed the profiler window).
+    # A load or warmup failure, which leaves no timed run, still gets one line
+    # so the failure shows up in the compare.
     if args.results_json:
         label = args.label or (
             f"{args.dtype or 'default'} b{args.batch} "
@@ -554,9 +604,11 @@ def main(argv: list[str] | None = None) -> None:
             "spyre_devices": spyre_devices,
             "iterations": args.iterations,
             # Set by scripts/run_profiling_modes.py --rounds; None otherwise.
-            "round": int(os.environ["PROFILING_ROUND"])
-            if os.environ.get("PROFILING_ROUND", "").isdigit()
-            else None,
+            "round": (
+                int(os.environ["PROFILING_ROUND"])
+                if os.environ.get("PROFILING_ROUND", "").isdigit()
+                else None
+            ),
             "profile_warmup": args.profile_warmup if args.with_profiling else None,
             "profile_active": args.profile_active if args.with_profiling else None,
             "load_s": result["load_s"],
@@ -568,6 +620,7 @@ def main(argv: list[str] | None = None) -> None:
             "wall_s": None,
             "wall_noexport_s": None,
             "export_s": None,
+            "prof_step_s": None,
             "ttft_ms": None,
             "decode_ms": None,
             "steady_itl_ms": None,
@@ -580,7 +633,9 @@ def main(argv: list[str] | None = None) -> None:
                 for record in records:
                     _f.write(json.dumps(record) + "\n")
         except OSError as e:
-            sys.stdout.write(f"\nCould not write --results-json {args.results_json!r}: {e}\n")
+            sys.stdout.write(
+                f"\nCould not write --results-json {args.results_json!r}: {e}\n"
+            )
         sys.stdout.flush()
 
     failed = result["status"] != "PASS"
